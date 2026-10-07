@@ -1,0 +1,8 @@
+# 与 L4 实测环境一致（torch 2.14.1 的 PyPI wheel 自带 CUDA 13 运行库，要求驱动 ≥ 580）
+torch==2.14.1
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+scipy==1.18.1
+pillow==12.3.0
+fastapi==0.142.2
+uvicorn==0.54.0
