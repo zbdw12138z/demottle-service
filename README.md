@@ -61,3 +61,7 @@ python3 tools/loadtest.py --url http://127.0.0.1:8000 --images '你的图/*.png'
 - 接口全部参数、错误码、环境变量、运维排障：[`docs/integration.md`](docs/integration.md)
 - 日志：`docker logs demottle`；版本（构建号）在 `/readyz` 和响应头 `X-Demottle-Version` 里，反馈问题时请带上它和请求 ID（响应头 `X-Request-ID`）
 - 回滚到上一版效果（只去斑驳、不补纹理）：`docker run` 时加 `-e DEMOTTLE_GRAIN=0`
+
+## 许可
+
+MIT（见 `LICENSE`）。人脸检测模型 `src/face_detection_yunet_2023mar.onnx` 来自 [OpenCV Zoo](https://github.com/opencv/opencv_zoo)，MIT 许可。
