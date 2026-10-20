@@ -1,11 +1,12 @@
-# demottle 去斑驳服务（demottle_v13，grain=0.5）
-# 构建  docker build -t demottle:v13 .
-# 运行  docker run --gpus all -p 8000:8000 demottle:v13
+# demottle 去斑驳服务（demottle_v15，grain=0.5）
+# 构建  docker build -t demottle:v15 .
+# 运行  docker run --gpus all -p 8000:8000 demottle:v15
+# 回退  docker run ... -e DEMOTTLE_GATES=off demottle:v15   （关掉 v15 的两道保护门，输出与 v13 逐位相同）
 # 要求  NVIDIA 驱动 ≥ 580（CUDA 13）；torch wheel 自带 CUDA 运行库，基础镜像只提供系统与 NVIDIA 容器约定
 FROM nvidia/cuda:13.0.3-base-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
-    DEMOTTLE_GRAIN=0.5 DEMOTTLE_WORKERS=3 DEMOTTLE_MAX_INFLIGHT=8 DEMOTTLE_WARM_SIZES=1536x2048,2048x1536 DEMOTTLE_PNG_LEVEL=1
+    DEMOTTLE_GRAIN=0.5 DEMOTTLE_GATES=on DEMOTTLE_WORKERS=3 DEMOTTLE_MAX_INFLIGHT=8 DEMOTTLE_WARM_SIZES=1536x2048,2048x1536 DEMOTTLE_PNG_LEVEL=1
 # gcc / libc6-dev / python3-dev：Triton 首次运行时要编译启动桩（缺了预热会失败）
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-dev gcc libc6-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/* && python3 -m venv /opt/venv
@@ -14,7 +15,7 @@ ENV PATH=/opt/venv/bin:$PATH
 WORKDIR /app
 COPY service/requirements.txt service/requirements.txt
 RUN pip install -r service/requirements.txt
-COPY src/demottle_v10.py src/demottle_v13.py src/face_detection_yunet_2023mar.onnx src/
+COPY src/demottle_v10.py src/demottle_v15.py src/face_detection_yunet_2023mar.onnx src/
 COPY service/ service/
 # 部署后自检：docker exec <容器> python3 tests/smoke_test.py --overload（宿主机无需装依赖）
 COPY tests/smoke_test.py tests/

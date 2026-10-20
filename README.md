@@ -20,8 +20,8 @@ docker run --rm --gpus all nvidia/cuda:13.0.3-base-ubuntu24.04 nvidia-smi
 ```bash
 git clone https://github.com/zbdw12138z/demottle-service.git && cd demottle-service
 
-docker build -t demottle:v13 .        # 首次构建要下载 PyTorch 等依赖，需要几分钟
-docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name demottle demottle:v13
+docker build -t demottle:v15 .        # 首次构建要下载 PyTorch 等依赖，需要几分钟
+docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name demottle demottle:v15
 
 docker exec demottle python3 tests/smoke_test.py --overload   # 自检：自动等预热（约 20 秒），最后一行 "19/19 项通过" 即可接流量
 ```
@@ -41,7 +41,7 @@ r.raise_for_status(); out_png = r.content
 - 请求体就是 GPT Image API 返回的原始 PNG 字节，响应体是处理后的 PNG（尺寸不变）。`bits=16` 输出 16 位（供转 10 位 HEIC）。
 - 健康检查用 `GET /readyz`（预热完成才返回 200），监控用 `GET /metrics`（Prometheus）。
 - 返回 **429** 表示这张卡满了：退避 1 秒重试或换实例。客户端超时建议 ≥ 10 秒。
-- 只送生图，不要送实拍照片。
+- 只送生图，不要送实拍照片，也不要送出图失败时兜底返回的原图。
 
 ## 容量与成本（L4 + 8 核 + 32 GiB，1536×2048）
 
@@ -60,7 +60,7 @@ python3 tools/loadtest.py --url http://127.0.0.1:8000 --images '你的图/*.png'
 
 - 接口全部参数、错误码、环境变量、运维排障：[`docs/integration.md`](docs/integration.md)
 - 日志：`docker logs demottle`；版本（构建号）在 `/readyz` 和响应头 `X-Demottle-Version` 里，反馈问题时请带上它和请求 ID（响应头 `X-Request-ID`）
-- 回滚到上一版效果（只去斑驳、不补纹理）：`docker run` 时加 `-e DEMOTTLE_GRAIN=0`
+- 回滚到上一版效果：`docker run` 时加 `-e DEMOTTLE_GATES=off`（与上一版逐位相同，不用重新构建）
 
 ## 许可
 

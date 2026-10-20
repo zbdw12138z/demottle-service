@@ -1,5 +1,5 @@
 """
-service/app.py — demottle 去斑驳 HTTP 服务（demottle_v13，grain=0.5）
+service/app.py — demottle 去斑驳 HTTP 服务（demottle_v15，grain=0.5）
 
 接口      POST /v1/demottle?bits=8|16[&grain=0–1]  请求体：图片原始字节（PNG，8 位 RGB / RGBA / 灰度；也接受 JPEG）
                                             返回：image/png（8 位或 16 位；alpha 原样保留；PNG 色彩块 sRGB/iCCP/gAMA/cHRM/pHYs 透传）
@@ -7,13 +7,14 @@ service/app.py — demottle 去斑驳 HTTP 服务（demottle_v13，grain=0.5）
           GET  /readyz                      预热完成后 200（含版本、构建号），否则 503
           GET  /metrics                     Prometheus 文本格式（含斑驳尺度 σ 分布、按 grain 的请求数）
           grain 不传用 DEMOTTLE_GRAIN；可按请求设置做线上 A/B（同一进程内互不干扰）
+回退      DEMOTTLE_GATES=off：关掉 v15 的纹理门与中尺度结构门，输出与 v13 逐位相同（不用换镜像即可回退；响应头带 gates=off）
 保护      在途请求（处理中 + 排队）≥ DEMOTTLE_MAX_INFLIGHT → 429（读完并丢弃请求体，不进 GPU 队列）；请求体 > DEMOTTLE_MAX_BYTES → 413；
           先读文件头尺寸 / 位深，像素数超限 → 413、非 8 位 → 415，都在解码之前
 并发      单进程；N 个工作线程（DEMOTTLE_WORKERS），每线程独占一条 CUDA 流，CPU 段与另一线程的 GPU 段重叠。
           启动时每个线程按常见尺寸逐个预热；未预热的新尺寸独占 GPU 处理一次，之后即算已预热；预热失败进程退出
 追踪      请求头 X-Request-ID 透传（无则生成），写入响应头与日志；请求超过 DEMOTTLE_STUCK_SECONDS（60）秒自动导出全部线程栈；
           kill -USR1 <pid> 随时导出线程栈
-配置      DEMOTTLE_GRAIN=0.5  DEMOTTLE_WORKERS=3  DEMOTTLE_MAX_INFLIGHT=8  DEMOTTLE_MAX_BYTES=67108864
+配置      DEMOTTLE_GRAIN=0.5  DEMOTTLE_GATES=on  DEMOTTLE_WORKERS=3  DEMOTTLE_MAX_INFLIGHT=8  DEMOTTLE_MAX_BYTES=67108864
           DEMOTTLE_MAX_PIXELS=16000000  DEMOTTLE_WARM_SIZES=1536x2048,2048x1536（宽x高）  DEMOTTLE_PNG_LEVEL=1
 启动      uvicorn service.app:app --host 0.0.0.0 --port 8000 --workers 1 --timeout-graceful-shutdown 30
 """
@@ -24,12 +25,12 @@ import numpy as np, cv2
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
-import demottle_v13 as A  # noqa: E402
+import demottle_v15 as A  # noqa: E402
 from service.png_fast import encode_png, png_color_chunks  # noqa: E402
 from fastapi import FastAPI, HTTPException, Request, Response  # noqa: E402
 from fastapi.responses import JSONResponse, PlainTextResponse  # noqa: E402
 
-VERSION = 'demottle_v13'
+VERSION = 'demottle_v15'
 _bi = os.path.join(os.path.dirname(__file__), 'BUILD_INFO')
 BUILD = json.load(open(_bi)) if os.path.exists(_bi) else {'build': 'dev', 'date': ''}
 CFG = dict(grain=float(os.environ.get('DEMOTTLE_GRAIN', '0.5')),
@@ -38,7 +39,11 @@ CFG = dict(grain=float(os.environ.get('DEMOTTLE_GRAIN', '0.5')),
            max_bytes=int(os.environ.get('DEMOTTLE_MAX_BYTES', str(64 << 20))),
            max_pixels=int(os.environ.get('DEMOTTLE_MAX_PIXELS', '16000000')),
            warm=[tuple(int(v) for v in s.split('x')) for s in os.environ.get('DEMOTTLE_WARM_SIZES', '1536x2048,2048x1536').split(',') if s],
-           png_level=int(os.environ.get('DEMOTTLE_PNG_LEVEL', '1')))
+           png_level=int(os.environ.get('DEMOTTLE_PNG_LEVEL', '1')),
+           gates=os.environ.get('DEMOTTLE_GATES', 'on').strip().lower())
+if CFG['gates'] not in ('on', 'off'):
+    raise SystemExit(f"DEMOTTLE_GATES 只能是 on 或 off（收到 {CFG['gates']!r}）")
+GATE_KW = {} if CFG['gates'] == 'on' else dict(tex_gate=0.0, mid_gate=0.0)   # off：与 v13 逐位相同
 log = logging.getLogger('demottle')
 logging.basicConfig(level=os.environ.get('DEMOTTLE_LOG_LEVEL', 'INFO'), format='%(asctime)s %(levelname)s %(message)s')
 faulthandler.register(signal.SIGUSR1, all_threads=True)          # kill -USR1 <pid>：导出全部线程栈到 stderr
@@ -111,7 +116,7 @@ class Metrics:
             L += ['# TYPE demottle_inflight gauge', f'demottle_inflight {self.inflight}',
                   '# TYPE demottle_ready gauge', f'demottle_ready {1 if _ready.is_set() else 0}',
                   '# TYPE demottle_build_info gauge',
-                  f'demottle_build_info{{version="{VERSION}",build="{BUILD["build"]}",grain="{CFG["grain"]}",workers="{CFG["workers"]}"}} 1']
+                  f'demottle_build_info{{version="{VERSION}",build="{BUILD["build"]}",grain="{CFG["grain"]}",gates="{CFG["gates"]}",workers="{CFG["workers"]}"}} 1']
             return '\n'.join(L) + '\n'
 
 
@@ -163,10 +168,10 @@ def _stream():
 def _run(rgb, path, bits, grain=None):
     g = CFG['grain'] if grain is None else grain
     st = _stream()
-    if st is None:                                       # 无 CUDA：v13 自动退回 v10（CPU，慢，仅供调试）
-        return A.demottle_v13(rgb, path=path, out_bits=bits, verbose=False, grain=g)
+    if st is None:                                       # 无 CUDA：v15 自动退回 v10（CPU，慢，仅供调试）
+        return A.demottle_v15(rgb, path=path, out_bits=bits, verbose=False, grain=g, **GATE_KW)
     with A.torch.cuda.stream(st):
-        out = A.demottle_v13(rgb, path=path, out_bits=bits, verbose=False, grain=g)
+        out = A.demottle_v15(rgb, path=path, out_bits=bits, verbose=False, grain=g, **GATE_KW)
         st.synchronize()
     return out
 
@@ -192,7 +197,7 @@ def _warm_all():
     for (w, h) in CFG['warm']:
         _warmed.add((h, w))
     _ready.set()
-    log.info(f'预热完成 {time.time() - t:.1f}s | {VERSION} build={BUILD["build"]} grain={CFG["grain"]} workers={len(ids)} '
+    log.info(f'预热完成 {time.time() - t:.1f}s | {VERSION} build={BUILD["build"]} grain={CFG["grain"]} gates={CFG["gates"]} workers={len(ids)} '
              f'max_inflight={CFG["max_inflight"]} 尺寸 {CFG["warm"]}')
 
 
@@ -293,7 +298,7 @@ def readyz():
     if not _ready.is_set():
         raise HTTPException(503, '预热中')
     return {'ready': True, 'version': VERSION, 'build': BUILD['build'], 'build_date': BUILD.get('date', ''),
-            'grain': CFG['grain'], 'workers': CFG['workers'], 'max_inflight': CFG['max_inflight']}
+            'grain': CFG['grain'], 'gates': CFG['gates'], 'workers': CFG['workers'], 'max_inflight': CFG['max_inflight']}
 
 
 @app.get('/metrics')
@@ -363,7 +368,7 @@ async def demottle(request: Request, bits: int = 8, grain: float | None = None):
                  f'sigmaL={sigma if sigma is None else round(sigma, 3)} {sec * 1000:.0f}ms '
                  f'(decode {tm["decode"] * 1000:.0f} algo {tm["algo"] * 1000:.0f} encode {tm["encode"] * 1000:.0f})')
         return Response(png, media_type='image/png', headers={
-            'X-Demottle-Version': f'{VERSION};build={BUILD["build"]};grain={g}', 'X-Demottle-Applied': '1' if applied else '0',
+            'X-Demottle-Version': f'{VERSION};build={BUILD["build"]};grain={g}' + (';gates=off' if GATE_KW else ''), 'X-Demottle-Applied': '1' if applied else '0',
             'X-Process-Ms': f'{sec * 1000:.0f}', 'X-Request-ID': rid})
     finally:
         _active.pop(rid, None)

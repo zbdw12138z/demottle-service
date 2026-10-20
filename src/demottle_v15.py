@@ -1,4 +1,17 @@
 """
+demottle_v15.py — v13 + 真实纹理保护（GPU）
+
+起因：keeper 实单图包（2026-10-19）上，JPEG 出图里大面积无方向细纹理（草地、沥青、水泥气孔、针织面料）被第 6 步 JPEG
+细节层替换（0.7–6px）与平面遍（6–25px）抹平。v15 在 v13 上加两道保护（关掉时与 v13 逐位相同）：
+  tex_gate  纹理门（默认 1 = 开）：纹理比 = 1.5px 细纹理局部 rms ÷ 实拍平坦区同亮度水平（grain_tab，按 L* 分档，
+            tools/fine_level.py 实测）。用绝对参照而不是图内参照：整张都是纹理的图（夜景路面）图内没有平坦参照。
+            JPEG 纹理比 1.5 → 3、PNG 3 → 6 之间由"可处理"过渡到"真实材质"（实测平坦区 JPEG ≤ 0.9、原生 PNG ≤ 2.4，
+            纹理 5–30）。真实材质处：平面遍不减斑驳，第 6 步不换细节层。
+  mid_gate  中尺度结构门（默认 1 = 开）：2–8px 频带局部 rms ≥ 1 → 2 L* 处视为真实结构（虚焦蕾丝网纹 ≈ 4 L*，
+            平坦区斑驳 ≤ 0.8 L*），平面遍不减；保住虚焦蕾丝、虚焦树叶，keeper 效果尺子与不开时相同
+  环境变量 DEMOTTLE_V15="key=val;key=val" 覆盖开关（实验用）。无 torch 时退回 v10（不含以上保护）。
+
+以下为 v13 的说明。
 demottle_v13.py — 实验版：v12 + 可选的效果改进开关（默认全关，此时与 v12 逐位相同）
 
 开关（均为 demottle_v13 的关键字参数）：
@@ -53,7 +66,8 @@ except Exception:
     triton = None
 
 DEV = None
-_OPT_DEFAULT = dict(chroma_mult=2.5, fine_keep=0.0, grain=0.0, grain_tab=(0.445, 0.363, 0.354, 0.275), skin_chroma_free=0.0, chroma_pass=0.0)
+_OPT_DEFAULT = dict(chroma_mult=2.5, fine_keep=0.0, grain=0.0, grain_tab=(0.445, 0.363, 0.354, 0.275), skin_chroma_free=0.0, chroma_pass=0.0,
+                    tex_gate=1.0, mid_gate=1.0)
 
 
 def _opt():
@@ -850,8 +864,33 @@ def chroma_barrier(ctx, lo=6.0, hi=9.0, dilate_px=5):
 
 
 # ================================================================= 4 平面遍（皮肤遍复用）
+def _tab_interp(Lstar, tab):
+    """按 L*（21 / 40 / 60 / 80 四档）线性插值实拍平坦区细纹理 rms（L*）；两端外延取端点值"""
+    xs = torch.tensor([21.0, 40.0, 60.0, 80.0], device=DEV); ys = torch.tensor(tab, device=DEV)
+    Lc = torch.clamp(Lstar, 21.0, 80.0).contiguous()
+    idx = torch.clamp(torch.searchsorted(xs, Lc) - 1, 0, 2)
+    t = clip01((Lc - xs[idx]) / (xs[idx + 1] - xs[idx]))
+    return ys[idx] + (ys[idx + 1] - ys[idx]) * t
+
+
+def texture_weight(labt, s, jpeg):
+    """真实材质权重 0–1：1.5px 细纹理局部 rms ÷ 实拍平坦区同亮度水平；JPEG 1.5 → 3、PNG 3 → 6 过渡"""
+    L = labt[..., 0]
+    f1 = L - gauss(L, 1.5 * s)
+    r = torch.sqrt(gauss(f1 * f1, 8 * s)) * 100.0 / _tab_interp(clip01(L) * 100.0, _opt()['grain_tab'])
+    lo, hi = (1.5, 3.0) if jpeg else (3.0, 6.0)
+    return gauss(clip01((r - lo) / (hi - lo)), 6 * s)
+
+
+def mid_weight(labt, s):
+    """中尺度真实结构权重 0–1：2–8px 频带局部 rms 1 → 2 L* 过渡（虚焦网纹、柔和图案；斑驳在此频带 ≤ 0.8 L*）"""
+    L = labt[..., 0] * 100.0
+    mid = gauss(L, 2 * s) - gauss(L, 8 * s)
+    return gauss(clip01((torch.sqrt(gauss(mid * mid, 12 * s)) - 1.0) / 1.0), 6 * s)
+
+
 def region_pass(labt, ctx, block, sig_diff, T_near, T_far, far_px, pin_seed, fade_px,
-                grain_sigma, restrict=None, chroma_boost=True, sig_override=None, gate='all'):
+                grain_sigma, restrict=None, chroma_boost=True, sig_override=None, gate='all', prot=None):
     H, W, s = ctx['H'], ctx['W'], ctx['s']
     base = gauss(labt, grain_sigma)
     ds = 0.25; hs, ws = int(H * ds), int(W * ds)
@@ -900,6 +939,8 @@ def region_pass(labt, ctx, block, sig_diff, T_near, T_far, far_px, pin_seed, fad
         c_res = resize_linear(coherence(m_s[..., 0].contiguous(), 20 * s * ds), W, H)
         iso = gauss(torch.minimum(clip01((0.55 - c_res) / 0.20), clip01((0.60 - coherence(fine_b, 12 * s)) / 0.20)), 6 * s)
     R1 = R1 * iso
+    if prot is not None:                                 # v15：真实材质 / 中尺度结构处不当斑驳
+        R1 = R1 * (1 - prot)
     w0 = clip01(1 - d2 / T ** 2) * M * R1
     w = torch.minimum(w0, gauss(w0, 10 * s))
     fill = torch.stack([normconv(m[..., c] * w, w, 10 * s) for c in range(3)], -1)
@@ -914,9 +955,9 @@ def region_pass(labt, ctx, block, sig_diff, T_near, T_far, far_px, pin_seed, fad
 
 
 # ================================================================= 主函数
-def demottle_v13(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=4.5, out_bits=8, T_near=3.0, T_far=6.0,
+def demottle_v15(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=4.5, out_bits=8, T_near=3.0, T_far=6.0,
                  far_px=40, pin_seed=4.0, fade_px=80, verbose=True, seed=0, chroma_mult=2.5, fine_keep=0.0, grain=0.0,
-                 skin_chroma_free=0.0, chroma_pass=0.0):
+                 skin_chroma_free=0.0, chroma_pass=0.0, tex_gate=1.0, mid_gate=1.0):
     """参数与返回值同 demottle_v10；有 CUDA 时在 GPU 上运行，否则直接调用 v10"""
     global DEV
     DEV = pick_device()
@@ -924,13 +965,14 @@ def demottle_v13(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=
         return V.demottle_v10(img_u8, path=path, strength=strength, skin_strength=skin_strength, clean_far=clean_far,
                               out_bits=out_bits, T_near=T_near, T_far=T_far, far_px=far_px, pin_seed=pin_seed,
                               fade_px=fade_px, verbose=verbose, seed=seed)
-    env = dict(kv.split('=') for kv in os.environ.get('DEMOTTLE_V13', '').split(';') if '=' in kv)   # 实验用：回归工具不传参数时覆盖开关
+    env = dict(kv.split('=') for kv in os.environ.get('DEMOTTLE_V15', '').split(';') if '=' in kv)   # 实验用：回归工具不传参数时覆盖开关
     chroma_mult = float(env.get('chroma_mult', chroma_mult)); fine_keep = float(env.get('fine_keep', fine_keep))
     grain = float(env.get('grain', grain)); skin_chroma_free = float(env.get('skin_chroma_free', skin_chroma_free))
     chroma_pass = float(env.get('chroma_pass', chroma_pass))
+    tex_gate = float(env.get('tex_gate', tex_gate)); mid_gate = float(env.get('mid_gate', mid_gate))
     with torch.no_grad():
         _TLS.opt = dict(chroma_mult=float(chroma_mult), fine_keep=float(fine_keep), grain=float(grain), grain_tab=(0.445, 0.363, 0.354, 0.275),
-                    skin_chroma_free=float(skin_chroma_free), chroma_pass=float(chroma_pass))
+                    skin_chroma_free=float(skin_chroma_free), chroma_pass=float(chroma_pass), tex_gate=float(tex_gate), mid_gate=float(mid_gate))
         return _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_far, far_px, pin_seed, fade_px, verbose, seed)
 
 
@@ -966,8 +1008,14 @@ def _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_f
     S_skin = gauss(up(S_bin), 6 * s) if n_faces > 0 else torch.zeros((H, W), device=DEV)
 
     T_far_eff = T_far if ctx['jpeg'] else (clean_far if clean_far else T_near)
+    prot = None                                          # v15：真实材质 / 中尺度结构保护（0–1）
+    if _opt()['tex_gate'] > 0:
+        prot = _opt()['tex_gate'] * texture_weight(labt, s, ctx['jpeg'])
+    if _opt()['mid_gate'] > 0:
+        mw = _opt()['mid_gate'] * mid_weight(labt, s)
+        prot = mw if prot is None else torch.maximum(prot, mw)
     R = region_pass(labt, ctx, barrier, sig_diff, T_near, T_far_eff, far_px, pin_seed, fade_px, grain_sigma,
-                    restrict=clip01(1 - S_skin))
+                    restrict=clip01(1 - S_skin), prot=prot)
     if R is not None:
         mf = R['m']
         if _opt()['fine_keep'] > 0:                        # 保留斑驳场中 6s 以下的小尺度部分（亮度）
@@ -1021,6 +1069,8 @@ def _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_f
         iso_fine = gauss(clip01((0.55 - coherence(fine_L, 12 * s)) / 0.20), 6 * s)
         interior = (gauss(clip01(R['dist_b'] / (24 * s)), 10 * s) * (1 - S_skin) * iso_fine)[..., None]
         sel = R['dist_b'] > 24 * s
+        if prot is not None:                             # v15：真实材质处保留原细节层，只换平坦区的块纹理
+            interior = interior * (1 - prot)[..., None]
         flat_amp = np.array([mad(R['grain'][..., c][sel]) if bool(sel.any()) else 0 for c in range(3)], np.float32)
         amp = up(np.maximum(flat_amp * 0.6, np.array([0.0030, 0.0010, 0.0010], np.float32)))
         n = torch.stack([gauss(nz[c], 0.7 * s) for c in range(3)], -1)
@@ -1086,7 +1136,7 @@ def warmup(sizes=((2048, 1536),), bits=(8,)):
         img = (rng.random((h, w, 3)) * 40 + 100).astype(np.uint8)
         img = cv2.GaussianBlur(img, (0, 0), 20)
         for b in bits:
-            demottle_v13(img, out_bits=b, verbose=False)
+            demottle_v15(img, out_bits=b, verbose=False)
     if DEV is not None and DEV.type == 'cuda':
         torch.cuda.synchronize()
 
@@ -1096,7 +1146,7 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     bits = 16 if '--16bit' in sys.argv else 8
     im = cv2.cvtColor(cv2.imread(args[0]), cv2.COLOR_BGR2RGB)
-    t = time.time(); out, _ = demottle_v13(im, path=args[0], out_bits=bits)
+    t = time.time(); out, _ = demottle_v15(im, path=args[0], out_bits=bits)
     if DEV is not None and DEV.type == 'cuda':
         torch.cuda.synchronize()
     print(f"{time.time()-t:.1f}s")
