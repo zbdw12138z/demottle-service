@@ -1,6 +1,6 @@
 # demottle 服务接入说明
 
-输入 GPT Image API 返回的原始图片字节（PNG），返回去斑驳后的 PNG（8 位或 16 位）。算法为 `demottle_v15`，`grain=0.5`：去掉平坦面上的斑驳；草地、沥青、水泥、针织面料这类真实细纹理和虚焦的柔和图案不当斑驳处理；再按实拍照片的水平补回一半被抹掉的细纹理（非皮肤区）。同一输入，输出逐像素相同。
+输入 GPT Image 出图的原始字节（PNG 或 JPEG；keeper 线上链路送的是 JPEG q92），返回去斑驳后的 PNG（8 位或 16 位）。算法为 `demottle_v16`，`grain=0.5`：去掉平坦面上的斑驳；草地、沥青、水泥、针织面料这类真实细纹理和虚焦的柔和图案不当斑驳处理；再按实拍照片的水平补回一半被抹掉的细纹理（非皮肤区）；JPEG 输入在平坦区换上的细颗粒不超过原图同处的细节强度，晴空、灰墙上不出可见颗粒。同一输入，输出逐像素相同。
 
 ## 接口
 
@@ -12,7 +12,7 @@
 | `bits` | `8`（默认，带 ±0.5 级抖动防色阶）或 `16`（不抖动，供下游转 10 位 HEIC） |
 | `grain` | 可选，0–1。不传 = 用服务配置（0.5）。只用于 A/B：同一服务按请求切换（`grain=0` = 只去斑驳、不补纹理），响应头会写明本次实际值 |
 | 响应体 | `image/png`；尺寸不变；有 alpha 原样保留（16 位时 ×257） |
-| 响应头 | `X-Demottle-Version: demottle_v15;build=<构建号>;grain=<本次实际值>`（回退模式另带 `;gates=off`）　`X-Demottle-Applied: 1/0`（0 = 量不到斑驳，像素原样返回）　`X-Process-Ms`（服务端耗时）　`X-Request-ID`（请求头带了就透传，否则服务生成） |
+| 响应头 | `X-Demottle-Version: demottle_v15;build=<构建号>;grain=<本次实际值>`（回退模式另带 `;syn_cap=off` 或 `;gates=off`）　`X-Demottle-Applied: 1/0`（0 = 量不到斑驳，像素原样返回）　`X-Process-Ms`（服务端耗时）　`X-Request-ID`（请求头带了就透传，否则服务生成） |
 | 元数据 | PNG 输入的色彩块（sRGB / iCCP / gAMA / cHRM / pHYs）原样写回输出；其他元数据（文本、EXIF）不保留 |
 | 错误（JSON：`{"error", "request_id"}`） | 400 解码失败或空请求体；413 请求体超过 64 MB 或像素数超上限（只读文件头判断，不解码）；415 非 PNG / JPEG 或非 8 位；422 `bits` 或 `grain` 非法；**429 服务繁忙**（在途请求已满，带 `Retry-After: 1`，请退避重试或换实例）；503 预热中；500 内部错误 |
 
@@ -32,12 +32,12 @@ r.raise_for_status(); out_png = r.content
 ## 部署
 
 ```bash
-docker build -t demottle:v15 .
-docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name demottle demottle:v15
+docker build -t demottle:v16 .
+docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name demottle demottle:v16
 docker exec demottle python3 tests/smoke_test.py --overload   # 部署后一键自检（在容器内跑，宿主机无需装依赖），退出码 0 = 通过
 ```
 
-冒烟测试检查：接口、确定性、与标准答案（`tests/golden/`，在 L4 上生成）最大差 ≤ 1 级、16 位、alpha、色彩块透传、各错误码、过载 429、监控指标。换显卡型号后若「与标准答案一致」一项不过，先看最大差是否为零星像素的 2–3 级（不同 GPU 的浮点细节），再联系算法负责人。
+冒烟测试检查：接口、确定性、与标准答案（`tests/golden/`，在 L4 上生成）最大差 ≤ 1 级（PNG 输入、JPEG 输入各一张）、16 位、alpha、色彩块透传、各错误码、过载 429、监控指标。换显卡型号后若「与标准答案一致」一项不过，先看最大差是否为零星像素的 2–3 级（不同 GPU 的浮点细节），再联系算法负责人。
 
 环境变量用 `docker run -e 名称=值` 设置。
 
@@ -49,7 +49,8 @@ docker exec demottle python3 tests/smoke_test.py --overload   # 部署后一键�
 | 启动 / 停止 | 预热约 20 s（Triton 编译、CUDA Graph 捕获、按常见尺寸缓存）；预热失败进程直接退出。SIGTERM 后等在途请求完成再退出（最多 30 s） |
 | 版本 | 构建号 = 包内源文件内容哈希，见 `service/BUILD_INFO`，也在 `/readyz`、响应头、`/metrics` 中 |
 | `DEMOTTLE_GRAIN` | 0.5。设为 0 = 只去斑驳、不补纹理 |
-| `DEMOTTLE_GATES` | `on`。设为 `off` = 关掉 v15 的纹理保护，输出与上一版（v13）逐位相同，用于回退（无需换镜像） |
+| `DEMOTTLE_SYN_CAP` | `on`。设为 `off` = 关掉 v16 的颗粒封顶，输出与上一版（v15）逐位相同，用于回退（无需换镜像；只影响 JPEG 输入） |
+| `DEMOTTLE_GATES` | `on`。设为 `off` = 再关掉 v15 的纹理保护（同时关颗粒封顶），输出与 v13 逐位相同，用于回退（无需换镜像） |
 | `DEMOTTLE_WORKERS` | 3（每卡并行处理的请求数；见下表） |
 | `DEMOTTLE_MAX_INFLIGHT` | 8（处理中 + 排队的上限，超出返回 429；约等于最多排队 2 s） |
 | `DEMOTTLE_WARM_SIZES` | `1536x2048,2048x1536`（宽x高）。其他尺寸首次请求会独占 GPU 多花约 1 s，之后正常 |
@@ -65,7 +66,7 @@ docker exec demottle python3 tests/smoke_test.py --overload   # 部署后一键�
 | 16 位 | 1 | 660–696 ms | 729–757 ms | 1.4–1.5 | $0.00027–0.00028 |
 | 16 位 | 3 | 1.1–1.4 s | 1.3–1.6 s | 2.1–2.6 | $0.00015–0.00019 |
 
-区间为不同机器上的四次实测（2026-10-05 / 10-07，上一版 v13）；切到 v15 后复测一次（2026-10-19）落在区间内：8 位并发 1 p50 520 ms、峰值 2.91 张/s，16 位 644 ms、峰值 2.61 张/s。¹ 其中一台机器首轮 p95 为 1.1 s（刚启动），其余三台 ≤ 572 ms。并发 3 以上只增加排队，不增加吞吐。成本按 L4 + 8 核 + 32 GiB 容器 $0.000398 / s 折算（2026-10 云厂商按秒计价），自有 GPU 请按自家卡价换算：单张成本 = 每秒卡价 ÷ 吞吐。上线前请在自家 GPU 上用 `tools/loadtest.py` 复测。
+区间为不同机器上的四次实测（2026-10-05 / 10-07，上一版 v13）；切到 v15 后复测一次（2026-10-19）落在区间内：8 位并发 1 p50 520 ms、峰值 2.91 张/s，16 位 644 ms、峰值 2.61 张/s。切到 v16 后复测（2026-10-27）：PNG 输入 8 位并发 1 p50 543 ms、峰值 2.74 张/s，16 位 697 ms、峰值 2.43 张/s；**JPEG 输入（keeper 链路）8 位并发 1 p50 474 ms、峰值 2.84 张/s（$0.00014/张）**，JPEG 解码约 15 ms，比 PNG 解码省约 60 ms。¹ 其中一台机器首轮 p95 为 1.1 s（刚启动），其余三台 ≤ 572 ms。并发 3 以上只增加排队，不增加吞吐。成本按 L4 + 8 核 + 32 GiB 容器 $0.000398 / s 折算（2026-10 云厂商按秒计价），自有 GPU 请按自家卡价换算：单张成本 = 每秒卡价 ÷ 吞吐。上线前请在自家 GPU 上用 `tools/loadtest.py` 复测。
 单张约 0.5 s 的构成：PNG 解码约 75 ms（CPU）、算法约 390 ms（其中 GPU 约 320 ms，CPU 侧人脸检测等约 70 ms）、8 位 PNG 编码约 45 ms（CPU，8 线程）。单个请求内串行；多个请求之间 CPU 与 GPU 重叠，并发 ≥ 3 时 GPU 接近满载，吞吐由 GPU 决定。成本按整机（GPU + 8 核 + 32 GiB）计，只算 GPU 卡价约为一半。
 
 建议：客户端超时 ≥ 10 s；每卡保持 3 个左右在途请求即可吃满吞吐，再多只会排队、拉高延迟。
@@ -80,7 +81,7 @@ docker exec demottle python3 tests/smoke_test.py --overload   # 部署后一键�
 | 429 增多 | 说明这张卡已满载（约 2.5 张/s）：加实例；不要调大 `DEMOTTLE_MAX_INFLIGHT`（只会让排队延迟变长） |
 | 413 / 415 | 输入不合规（过大 / 非 8 位 / 非 PNG、JPEG）；在拒绝前已读完请求体，客户端收到的是正常错误码，不是连接重置。唯一例外：`Content-Length` 声明超过 64 MB 时直接拒绝并关闭连接 |
 | 预热失败 | 进程退出（`--restart unless-stopped` 会自动重启）；日志里「预热失败」后的异常即原因（最常见：驱动版本不够、显存不足） |
-| 回滚 | 带 `-e DEMOTTLE_GATES=off` 重新 `docker run`：回到上一版（v13）效果，逐位相同，响应头带 `gates=off`；再加 `-e DEMOTTLE_GRAIN=0` = 只去斑驳、不补纹理 |
+| 回滚 | 带 `-e DEMOTTLE_SYN_CAP=off` 重新 `docker run`：回到上一版（v15）效果，逐位相同，响应头带 `syn_cap=off`；带 `-e DEMOTTLE_GATES=off`：回到 v13，响应头带 `gates=off`；再加 `-e DEMOTTLE_GRAIN=0` = 只去斑驳、不补纹理 |
 
 ## 行为与注意事项
 

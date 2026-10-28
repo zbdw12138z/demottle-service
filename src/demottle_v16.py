@@ -1,4 +1,15 @@
 """
+demottle_v16.py — v15 + 第 6 步合成颗粒封顶（GPU）
+
+起因：keeper 实单全量复测（2026-10-27）里，平坦区 13% 配对最细尺度（0.7–1.5s）亮度能量超过实拍 1.5 倍（出图本身 2%），
+深色毛衣、晴空可见颗粒。归因：超标配对上出图本身与实拍相当（中位 0.95），v12（无细纹理补偿）已到 1.61——第 6 步把
+JPEG 平坦区细节层换成胶片式颗粒时，颗粒幅度是全图一个值（平坦区细节层 MAD × 0.6，下限 0.3 L*），比原处细节还强；
+细纹理补偿（grain）只再加约 14%。v16 加一个开关（关掉时与 v15 逐位相同）：
+  syn_cap  合成颗粒封顶（默认 1 = 开）：每处合成颗粒的局部 rms 不超过原图同处细节的局部 rms——"亮度 − 1.5s 高斯"
+           与整个细节层（"− 3s 高斯"）两个口径取较严者，8s 窗口；三个通道同一缩放。替换只换掉 JPEG 块纹理，不添能量
+  环境变量 DEMOTTLE_V16="key=val;key=val" 覆盖开关（实验用）。无 torch 时退回 v10（不含 v15 / v16 的改动）。
+
+以下为 v15 的说明。
 demottle_v15.py — v13 + 真实纹理保护（GPU）
 
 起因：keeper 实单图包（2026-10-19）上，JPEG 出图里大面积无方向细纹理（草地、沥青、水泥气孔、针织面料）被第 6 步 JPEG
@@ -9,7 +20,7 @@ demottle_v15.py — v13 + 真实纹理保护（GPU）
             纹理 5–30）。真实材质处：平面遍不减斑驳，第 6 步不换细节层。
   mid_gate  中尺度结构门（默认 1 = 开）：2–8px 频带局部 rms ≥ 1 → 2 L* 处视为真实结构（虚焦蕾丝网纹 ≈ 4 L*，
             平坦区斑驳 ≤ 0.8 L*），平面遍不减；保住虚焦蕾丝、虚焦树叶，keeper 效果尺子与不开时相同
-  环境变量 DEMOTTLE_V15="key=val;key=val" 覆盖开关（实验用）。无 torch 时退回 v10（不含以上保护）。
+  环境变量 DEMOTTLE_V16="key=val;key=val" 覆盖开关（实验用）。无 torch 时退回 v10（不含以上保护）。
 
 以下为 v13 的说明。
 demottle_v13.py — 实验版：v12 + 可选的效果改进开关（默认全关，此时与 v12 逐位相同）
@@ -67,7 +78,7 @@ except Exception:
 
 DEV = None
 _OPT_DEFAULT = dict(chroma_mult=2.5, fine_keep=0.0, grain=0.0, grain_tab=(0.445, 0.363, 0.354, 0.275), skin_chroma_free=0.0, chroma_pass=0.0,
-                    tex_gate=1.0, mid_gate=1.0)
+                    tex_gate=1.0, mid_gate=1.0, syn_cap=1.0)
 
 
 def _opt():
@@ -955,9 +966,9 @@ def region_pass(labt, ctx, block, sig_diff, T_near, T_far, far_px, pin_seed, fad
 
 
 # ================================================================= 主函数
-def demottle_v15(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=4.5, out_bits=8, T_near=3.0, T_far=6.0,
+def demottle_v16(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=4.5, out_bits=8, T_near=3.0, T_far=6.0,
                  far_px=40, pin_seed=4.0, fade_px=80, verbose=True, seed=0, chroma_mult=2.5, fine_keep=0.0, grain=0.0,
-                 skin_chroma_free=0.0, chroma_pass=0.0, tex_gate=1.0, mid_gate=1.0):
+                 skin_chroma_free=0.0, chroma_pass=0.0, tex_gate=1.0, mid_gate=1.0, syn_cap=1.0):
     """参数与返回值同 demottle_v10；有 CUDA 时在 GPU 上运行，否则直接调用 v10"""
     global DEV
     DEV = pick_device()
@@ -965,14 +976,16 @@ def demottle_v15(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=
         return V.demottle_v10(img_u8, path=path, strength=strength, skin_strength=skin_strength, clean_far=clean_far,
                               out_bits=out_bits, T_near=T_near, T_far=T_far, far_px=far_px, pin_seed=pin_seed,
                               fade_px=fade_px, verbose=verbose, seed=seed)
-    env = dict(kv.split('=') for kv in os.environ.get('DEMOTTLE_V15', '').split(';') if '=' in kv)   # 实验用：回归工具不传参数时覆盖开关
+    env = dict(kv.split('=') for kv in os.environ.get('DEMOTTLE_V16', '').split(';') if '=' in kv)   # 实验用：回归工具不传参数时覆盖开关
     chroma_mult = float(env.get('chroma_mult', chroma_mult)); fine_keep = float(env.get('fine_keep', fine_keep))
     grain = float(env.get('grain', grain)); skin_chroma_free = float(env.get('skin_chroma_free', skin_chroma_free))
     chroma_pass = float(env.get('chroma_pass', chroma_pass))
     tex_gate = float(env.get('tex_gate', tex_gate)); mid_gate = float(env.get('mid_gate', mid_gate))
+    syn_cap = float(env.get('syn_cap', syn_cap))
     with torch.no_grad():
         _TLS.opt = dict(chroma_mult=float(chroma_mult), fine_keep=float(fine_keep), grain=float(grain), grain_tab=(0.445, 0.363, 0.354, 0.275),
-                    skin_chroma_free=float(skin_chroma_free), chroma_pass=float(chroma_pass), tex_gate=float(tex_gate), mid_gate=float(mid_gate))
+                    skin_chroma_free=float(skin_chroma_free), chroma_pass=float(chroma_pass), tex_gate=float(tex_gate), mid_gate=float(mid_gate),
+                    syn_cap=float(syn_cap))
         return _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_far, far_px, pin_seed, fade_px, verbose, seed)
 
 
@@ -1078,6 +1091,15 @@ def _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_f
         shade = (clip01(Lref / 0.08) * (1.2 - 0.4 * Lref))[..., None]
         syn = n * amp * shade
         syn = torch.cat([syn[..., :1], syn[..., 1:] * 0.3], -1)
+        if _opt()['syn_cap'] > 0:                        # v16：合成颗粒局部 rms 不超过原图同处细节（两个口径取较严者）
+            L0, nL = labt[..., 0], n[..., 0]
+            o_f = torch.sqrt(gauss((L0 - gauss(L0, 1.5 * s)) ** 2, 8 * s))
+            o_d = torch.sqrt(gauss(R['grain'][..., 0] ** 2, 8 * s))
+            k_f = float(torch.sqrt(torch.mean((nL - gauss(nL, 1.5 * s)) ** 2)))   # 单位颗粒在 1.5s 口径下的 rms
+            a_L = amp[0] * shade[..., 0] + 1e-6                                  # 合成颗粒（亮度）局部 rms
+            cap = torch.minimum(torch.minimum(o_f / (a_L * k_f), o_d / a_L), torch.ones_like(a_L))
+            cap = 1 - _opt()['syn_cap'] * (1 - cap)
+            syn = syn * cap[..., None]
         out = out - R['grain'] * interior + syn * interior + 0.4 * syn * (1 - interior)
     if out_bits == 8:
         dith = (di - 0.5) * 0.004 * clip01(Lref / 0.05)
@@ -1136,7 +1158,7 @@ def warmup(sizes=((2048, 1536),), bits=(8,)):
         img = (rng.random((h, w, 3)) * 40 + 100).astype(np.uint8)
         img = cv2.GaussianBlur(img, (0, 0), 20)
         for b in bits:
-            demottle_v15(img, out_bits=b, verbose=False)
+            demottle_v16(img, out_bits=b, verbose=False)
     if DEV is not None and DEV.type == 'cuda':
         torch.cuda.synchronize()
 
@@ -1146,7 +1168,7 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     bits = 16 if '--16bit' in sys.argv else 8
     im = cv2.cvtColor(cv2.imread(args[0]), cv2.COLOR_BGR2RGB)
-    t = time.time(); out, _ = demottle_v15(im, path=args[0], out_bits=bits)
+    t = time.time(); out, _ = demottle_v16(im, path=args[0], out_bits=bits)
     if DEV is not None and DEV.type == 'cuda':
         torch.cuda.synchronize()
     print(f"{time.time()-t:.1f}s")

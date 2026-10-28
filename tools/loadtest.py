@@ -2,8 +2,8 @@
 loadtest.py — demottle 服务压测：各并发下的单张延迟分位数（p50 / p95 / p99）与单卡吞吐、折算单张成本
 
 用法  python3 tools/loadtest.py --url http://127.0.0.1:8000 --images 'data/jpeg/*.jpeg' [--concurrency 1,2,4,8] [--n 40]
-                               [--bits 8] [--usd-per-s 0.000398]
-说明  输入图先在本地转成 PNG 字节（与线上 API 原始 PNG 同类），请求前等 /readyz；
+                               [--bits 8] [--usd-per-s 0.000398] [--raw]
+说明  输入图先在本地转成 PNG 字节（与线上 API 原始 PNG 同类）；--raw 原样发送文件字节（JPEG 输入 = keeper 线上链路）。请求前等 /readyz；
       每档并发先发 1 轮热身（不计），再计时 n 个请求。吞吐 = n / 墙钟时间；单张成本 = 每秒卡价 / 吞吐。
 """
 import argparse, glob, json, time, urllib.request
@@ -22,7 +22,7 @@ def post(url, data, bits):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--url', default='http://127.0.0.1:8000'); ap.add_argument('--images', default='data/jpeg/*.jpeg')
     ap.add_argument('--concurrency', default='1,2,4,8'); ap.add_argument('--n', type=int, default=40); ap.add_argument('--bits', type=int, default=8)
-    ap.add_argument('--usd-per-s', type=float, default=None)
+    ap.add_argument('--usd-per-s', type=float, default=None); ap.add_argument('--raw', action='store_true', help='原样发送文件字节，不转 PNG')
     a = ap.parse_args()
     for _ in range(600):
         try:
@@ -35,8 +35,10 @@ def main():
     pngs = []
     for p in sorted(glob.glob(a.images)):
         im = cv2.imread(p)
+        if a.raw:
+            pngs.append(open(p, 'rb').read()); continue
         ok, buf = cv2.imencode('.png', im, [cv2.IMWRITE_PNG_COMPRESSION, 3]); pngs.append(buf.tobytes())
-    print(f'服务 {info} | 输入 {len(pngs)} 张 PNG（{im.shape[1]}×{im.shape[0]}，平均 {np.mean([len(x) for x in pngs]) / 1e6:.1f} MB）| bits={a.bits}')
+    print(f'服务 {info} | 输入 {len(pngs)} 张 {"原样文件" if a.raw else "PNG"}（{im.shape[1]}×{im.shape[0]}，平均 {np.mean([len(x) for x in pngs]) / 1e6:.1f} MB）| bits={a.bits}')
     print(f'{"并发":>4}{"请求":>6}{"p50":>9}{"p95":>9}{"p99":>9}{"服务端p50":>11}{"吞吐":>12}' + (f'{"单张成本":>16}' if a.usd_per_s else ''))
     res = {}
     for c in map(int, a.concurrency.split(',')):
