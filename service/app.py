@@ -1,8 +1,13 @@
 """
 service/app.py — demottle 去斑驳 HTTP 服务（demottle_v16，grain=0.5）
 
-接口      POST /v1/demottle?bits=8|16[&grain=0–1]  请求体：图片原始字节（PNG，8 位 RGB / RGBA / 灰度；也接受 JPEG）
-                                            返回：image/png（8 位或 16 位；alpha 原样保留；PNG 色彩块 sRGB/iCCP/gAMA/cHRM/pHYs 透传）
+接口      POST /v1/demottle?bits=8|16[&grain=0–1][&format=auto|jpeg|png]
+                                            请求体：图片原始字节（JPEG 或 PNG，8 位 RGB / RGBA / 灰度）
+                                            返回：format=auto（默认）进什么出什么——
+                                              JPEG 进 → image/jpeg：沿用输入的量化表与色度抽样（keeper 的 libjpeg q92、4:2:0 原样保持），
+                                                        ICC / EXIF 原样带回，baseline、标准哈夫曼表
+                                              PNG 进  → image/png（8 位或 16 位；alpha 原样保留；PNG 色彩块 sRGB/iCCP/gAMA/cHRM/pHYs 透传）
+                                            bits=16 一律出 PNG（JPEG 只有 8 位）；format=jpeg 与 bits=16 同时给 → 422
           GET  /healthz                     进程存活
           GET  /readyz                      预热完成后 200（含版本、构建号），否则 503
           GET  /metrics                     Prometheus 文本格式（含斑驳尺度 σ 分布、按 grain 的请求数）
@@ -23,7 +28,9 @@ service/app.py — demottle 去斑驳 HTTP 服务（demottle_v16，grain=0.5）
 import asyncio, faulthandler, json, logging, os, signal, struct, sys, tempfile, threading, time, uuid
 import concurrent.futures as cf
 from contextlib import asynccontextmanager
+import io
 import numpy as np, cv2
+from PIL import Image, JpegImagePlugin
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
@@ -251,7 +258,26 @@ def _decode(data):
     return cv2.cvtColor(im, cv2.COLOR_BGR2RGB), alpha, fmt
 
 
-def _process(data, bits, grain):
+def jpeg_params(data):
+    """JPEG 输入的编码参数：量化表、色度抽样、ICC、EXIF（出 JPEG 时原样沿用）；读不到量化表或非 YCbCr 三通道时退回 q92 + 4:2:0"""
+    try:
+        im = Image.open(io.BytesIO(data))
+        kw = dict(icc_profile=im.info.get('icc_profile'), exif=im.info.get('exif', b''))
+        q, samp = getattr(im, 'quantization', None), JpegImagePlugin.get_sampling(im)
+        if im.mode == 'RGB' and q and len(q) >= 2 and samp in (0, 1, 2):
+            return kw | dict(qtables=[q[k] for k in sorted(q)], subsampling=samp)
+        return kw | dict(quality=92, subsampling=2)
+    except Exception:
+        return dict(quality=92, subsampling=2)
+
+
+def encode_jpeg(rgb, params):
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, 'JPEG', optimize=False, progressive=False, **{k: v for k, v in params.items() if v is not None})
+    return buf.getvalue()
+
+
+def _process(data, bits, grain, fmt_out='auto'):
     t0 = time.perf_counter()
     rgb, alpha, fmt = _decode(data)
     extra = png_color_chunks(data) if fmt == 'png' else []
@@ -272,11 +298,14 @@ def _process(data, bits, grain):
     t2 = time.perf_counter()
     if alpha is not None:
         out = np.dstack([out, alpha if bits == 8 else (alpha.astype(np.uint16) * 257)])
-    png = encode_png(out, level=CFG['png_level'], extra_chunks=extra)   # 多线程 PNG 编码（标准 PNG）
+    if bits == 8 and alpha is None and (fmt_out == 'jpeg' or (fmt_out == 'auto' and fmt == 'jpeg')):
+        body, mt = encode_jpeg(out, jpeg_params(data) if fmt == 'jpeg' else dict(quality=92, subsampling=2)), 'image/jpeg'
+    else:
+        body, mt = encode_png(out, level=CFG['png_level'], extra_chunks=extra), 'image/png'   # 多线程 PNG 编码（标准 PNG）
     t3 = time.perf_counter()
     sig = ctx.get('sigma')
     sigma = float(sig[0]) * 100 if sig is not None else None
-    return png, bool(ctx.get('ok', False)), dict(decode=t1 - t0, algo=t2 - t1, encode=t3 - t2), f'{key[1]}x{key[0]}', sigma
+    return body, mt, bool(ctx.get('ok', False)), dict(decode=t1 - t0, algo=t2 - t1, encode=t3 - t2), f'{key[1]}x{key[0]}', sigma
 
 
 # ================================================================= HTTP
@@ -334,13 +363,17 @@ async def _drain(request):
 
 
 @app.post('/v1/demottle')
-async def demottle(request: Request, bits: int = 8, grain: float | None = None):
+async def demottle(request: Request, bits: int = 8, grain: float | None = None, format: str = 'auto'):
     rid = request.headers.get('X-Request-ID') or uuid.uuid4().hex[:16]
     cl = request.headers.get('content-length')
     if cl and cl.isdigit() and int(cl) > CFG['max_bytes']:          # 声明体积就超限：不读，直接拒绝并关闭连接
         return _err(413, f'请求体 {cl} 字节超过上限 {CFG["max_bytes"]}', rid, close=True)
     if bits not in (8, 16):
         await _drain(request); return _err(422, 'bits 只能是 8 或 16', rid)
+    if format not in ('auto', 'jpeg', 'png'):
+        await _drain(request); return _err(422, 'format 只能是 auto、jpeg 或 png', rid)
+    if format == 'jpeg' and bits == 16:
+        await _drain(request); return _err(422, 'JPEG 只有 8 位：format=jpeg 时 bits 须为 8', rid)
     if grain is not None and not (0.0 <= grain <= 1.0):
         await _drain(request); return _err(422, 'grain 须在 0–1 之间', rid)
     g = CFG['grain'] if grain is None else round(float(grain), 3)
@@ -363,7 +396,7 @@ async def demottle(request: Request, bits: int = 8, grain: float | None = None):
             return _err(400, '请求体为空', rid)
         t = time.perf_counter(); _active[rid] = time.time()
         try:
-            png, applied, tm, size, sigma = await asyncio.get_running_loop().run_in_executor(_pool, _process, bytes(buf), bits, g)
+            body, mt, applied, tm, size, sigma = await asyncio.get_running_loop().run_in_executor(_pool, _process, bytes(buf), bits, g, format)
         except HTTPException as e:
             return _err(e.status_code, e.detail, rid)
         except Exception:
@@ -371,10 +404,10 @@ async def demottle(request: Request, bits: int = 8, grain: float | None = None):
             return _err(500, '内部错误', rid)
         sec = time.perf_counter() - t
         M.done('200', sec, tm, applied, sigma, g)
-        log.info(f'rid={rid} {size} {len(buf) // 1024}KB→{len(png) // 1024}KB bits={bits} grain={g} applied={int(applied)} '
+        log.info(f'rid={rid} {size} {len(buf) // 1024}KB→{len(body) // 1024}KB {mt[6:]} bits={bits} grain={g} applied={int(applied)} '
                  f'sigmaL={sigma if sigma is None else round(sigma, 3)} {sec * 1000:.0f}ms '
                  f'(decode {tm["decode"] * 1000:.0f} algo {tm["algo"] * 1000:.0f} encode {tm["encode"] * 1000:.0f})')
-        return Response(png, media_type='image/png', headers={
+        return Response(body, media_type=mt, headers={
             'X-Demottle-Version': f'{VERSION};build={BUILD["build"]};grain={g}' + ROLLBACK, 'X-Demottle-Applied': '1' if applied else '0',
             'X-Process-Ms': f'{sec * 1000:.0f}', 'X-Request-ID': rid})
     finally:

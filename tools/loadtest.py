@@ -3,7 +3,7 @@ loadtest.py — demottle 服务压测：各并发下的单张延迟分位数（p
 
 用法  python3 tools/loadtest.py --url http://127.0.0.1:8000 --images 'data/jpeg/*.jpeg' [--concurrency 1,2,4,8] [--n 40]
                                [--bits 8] [--usd-per-s 0.000398] [--raw]
-说明  输入图先在本地转成 PNG 字节（与线上 API 原始 PNG 同类）；--raw 原样发送文件字节（JPEG 输入 = keeper 线上链路）。请求前等 /readyz；
+说明  输入图先在本地转成 PNG 字节（与线上 API 原始 PNG 同类）；--raw 原样发送文件字节（JPEG 输入 = keeper 线上链路，服务默认回 JPEG）。请求前等 /readyz；
       每档并发先发 1 轮热身（不计），再计时 n 个请求。吞吐 = n / 墙钟时间；单张成本 = 每秒卡价 / 吞吐。
 """
 import argparse, glob, json, time, urllib.request

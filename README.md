@@ -1,6 +1,6 @@
 # demottle 服务
 
-GPT Image 生图后处理：去掉平坦面（墙、天空、皮肤）上的斑驳、蜡感和脏色。输入 PNG，输出同尺寸 PNG；纯算法，同一输入同一输出。
+GPT Image 生图后处理：去掉平坦面（墙、天空、皮肤）上的斑驳、蜡感和脏色。进什么出什么：JPEG 进 JPEG 出（同量化表、同抽样，ICC / EXIF 带回），PNG 进 PNG 出，尺寸不变；纯算法，同一输入同一输出。
 
 ## 0. 机器要求（先确认）
 
@@ -23,7 +23,7 @@ git clone https://github.com/zbdw12138z/demottle-service.git && cd demottle-serv
 docker build -t demottle:v16 .        # 首次构建要下载 PyTorch 等依赖，需要几分钟
 docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name demottle demottle:v16
 
-docker exec demottle python3 tests/smoke_test.py --overload   # 自检：自动等预热（约 20 秒），最后一行 "21/21 项通过" 即可接流量
+docker exec demottle python3 tests/smoke_test.py --overload   # 自检：自动等预热（约 20 秒），最后一行 "25/25 项通过" 即可接流量
 ```
 
 ## 2. 调用
@@ -38,7 +38,7 @@ r = requests.post('http://127.0.0.1:8000/v1/demottle', params={'bits': 8}, data=
 r.raise_for_status(); out_png = r.content
 ```
 
-- 请求体就是 GPT Image API 返回的原始 PNG 字节，响应体是处理后的 PNG（尺寸不变）。`bits=16` 输出 16 位（供转 10 位 HEIC）。
+- 请求体就是出图的原始字节（JPEG 或 PNG），响应体格式与输入相同（尺寸不变）：JPEG 进 JPEG 出（`image/jpeg`），PNG 进 PNG 出。要强制格式加 `format=jpeg` 或 `format=png`。`bits=16` 输出 16 位 PNG（供转 10 位 HEIC）。
 - 健康检查用 `GET /readyz`（预热完成才返回 200），监控用 `GET /metrics`（Prometheus）。
 - 返回 **429** 表示这张卡满了：退避 1 秒重试或换实例。客户端超时建议 ≥ 10 秒。
 - 只送生图，不要送实拍照片，也不要送出图失败时兜底返回的原图。

@@ -5,15 +5,18 @@ smoke_test.py — demottle 服务冒烟测试：部署后一键确认"接口通�
 检查  1 /healthz /readyz /metrics
       2 合成测试图（确定性生成，含斑驳）8 位：200、尺寸不变、X-Demottle-Applied=1、平均改动在合理范围、两次请求逐字节相同
       3 与标准答案 tests/golden/synth_8bit.png 比：最大差 ≤ 1 级（标准答案在 L4 上生成；--write-golden 重写）
-      3b JPEG 输入（keeper 线上链路；合成图的 q92 4:2:0 文件 tests/golden/synth_q92.jpg）：200、已处理、与标准答案 synth_jpeg_8bit.png 最大差 ≤ 1 级
+      3b JPEG 输入（keeper 线上链路；合成图的 q92 4:2:0 文件 tests/golden/synth_q92.jpg）：200、已处理；format=png 取无损结果与标准答案 synth_jpeg_8bit.png 比，最大差 ≤ 1 级
+      3c JPEG 进 JPEG 出（默认 format=auto）：image/jpeg、尺寸不变、量化表与色度抽样与输入相同、baseline、与无损结果 PSNR ≥ 40 dB、两次逐字节相同；
+         输入带的 ICC / EXIF 原样带回；format=jpeg + bits=16、format=gif → 422
       4 16 位输出；RGBA 输入 alpha 原样保留；PNG sRGB 块透传；请求 ID 透传
       5 错误码：空请求体 400、非图片 415、bits=7 / grain=2 422、文件头声明超大尺寸 413（不解码）、16 位输入 415；按请求设置 grain 生效
       6（--overload）并发超过 max_inflight：出现 429 且带 Retry-After，其余请求成功
 退出码 0 = 全部通过
 """
-import argparse, json, os, struct, sys, time, urllib.error, urllib.request, zlib
+import argparse, io, json, os, struct, sys, time, urllib.error, urllib.request, zlib
 import concurrent.futures as cf
 import numpy as np, cv2
+from PIL import Image, JpegImagePlugin
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDEN = os.path.join(HERE, 'golden', 'synth_8bit.png')
@@ -47,17 +50,23 @@ def png_bytes(rgb_or_rgba, srgb=False):
     return b
 
 
-def call(url, data, bits=8, rid=None, path='/v1/demottle', grain=None):
+def call(url, data, bits=8, rid=None, path='/v1/demottle', grain=None, fmt=None):
     hdr = {'Content-Type': 'application/octet-stream'}
     if rid:
         hdr['X-Request-ID'] = rid
-    q = f'?bits={bits}' + (f'&grain={grain}' if grain is not None else '')
+    q = f'?bits={bits}' + (f'&grain={grain}' if grain is not None else '') + (f'&format={fmt}' if fmt else '')
     req = urllib.request.Request(f'{url}{path}{q}', data=data, method='POST', headers=hdr)
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             return r.status, r.read(), r.headers           # 响应头查找不区分大小写
     except urllib.error.HTTPError as e:
         return e.code, e.read(), e.headers
+
+
+def with_icc_exif(jpg, icc, exif):
+    """在 SOI 之后插入 APP1 Exif 与 APP2 ICC_PROFILE 段（像素数据不动）"""
+    seg = lambda mk, payload: b'\xff' + bytes([mk]) + struct.pack('>H', len(payload) + 2) + payload
+    return jpg[:2] + seg(0xE1, exif) + seg(0xE2, b'ICC_PROFILE\x00\x01\x01' + icc) + jpg[2:]
 
 
 def decode(png):
@@ -113,9 +122,28 @@ def main():
         open(JPEG_IN, 'wb').write(cv2.imencode('.jpg', src[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, 92,
                                   cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420])[1].tobytes())
     if os.path.exists(JPEG_IN):
-        st, oj, hj = call(a.url, open(JPEG_IN, 'rb').read(), rid='smoke-jpeg'); ij = decode(oj) if st == 200 else None
+        jin = open(JPEG_IN, 'rb').read()
+        st, oj, hj = call(a.url, jin, rid='smoke-jpeg', fmt='png'); ij = decode(oj) if st == 200 else None
         check('JPEG 输入：200、尺寸不变、已处理', st == 200 and ij is not None and ij.shape == src.shape and hj.get('X-Demottle-Applied') == '1',
               f'状态 {st} applied={hj.get("X-Demottle-Applied")}')
+        st, oj2, hj2 = call(a.url, jin)                    # 默认 format=auto：JPEG 进 JPEG 出
+        ok = st == 200 and hj2.get('Content-Type', '').startswith('image/jpeg') and ij is not None
+        if ok:
+            i0, o_ = Image.open(io.BytesIO(jin)), Image.open(io.BytesIO(oj2)); jx = np.asarray(o_.convert('RGB'))
+            psnr = 10 * np.log10(255 ** 2 / max(np.mean((jx.astype(float) - ij[..., :3]) ** 2), 1e-9))
+            same = o_.quantization == i0.quantization and JpegImagePlugin.get_sampling(o_) == JpegImagePlugin.get_sampling(i0) == 2
+            ok = jx.shape == src.shape and same and not o_.info.get('progressive') and psnr >= 40
+            detail = f'量化表 / 4:2:0 相同={same} PSNR {psnr:.1f} dB {len(jin) // 1024}→{len(oj2) // 1024} KB'
+        else:
+            detail = f'状态 {st} Content-Type={hj2.get("Content-Type")}'
+        check('JPEG 进 JPEG 出：同量化表、同抽样、baseline、与无损结果 PSNR ≥ 40 dB', ok, detail)
+        check('JPEG 出：两次请求逐字节相同', ok and call(a.url, jin)[1] == oj2)
+        icc, exif = b'demottle-smoke-icc' * 8, b'Exif\x00\x00MM\x00\x2a\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00'
+        st, oe, _ = call(a.url, with_icc_exif(jin, icc, exif))
+        oi = Image.open(io.BytesIO(oe)) if st == 200 else None
+        check('JPEG 出：ICC / EXIF 原样带回', oi is not None and oi.info.get('icc_profile') == icc and oi.info.get('exif') == exif,
+              f'状态 {st}')
+        check('format=jpeg + bits=16 → 422、format=gif → 422', call(a.url, jin, bits=16, fmt='jpeg')[0] == 422 and call(a.url, jin, fmt='gif')[0] == 422)
         if a.write_golden:
             open(GOLDEN_JPEG, 'wb').write(oj); check('写 JPEG 标准答案', True, GOLDEN_JPEG)
         elif ij is not None and os.path.exists(GOLDEN_JPEG):
