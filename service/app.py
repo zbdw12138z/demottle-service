@@ -1,5 +1,5 @@
 """
-service/app.py — demottle 去斑驳 HTTP 服务（demottle_v16，grain=0.5）
+service/app.py — demottle 去斑驳 HTTP 服务（demottle_v17，grain=0.5）
 
 接口      POST /v1/demottle?bits=8|16[&grain=0–1][&format=auto|jpeg|png]
                                             请求体：图片原始字节（JPEG 或 PNG，8 位 RGB / RGBA / 灰度）
@@ -12,16 +12,17 @@ service/app.py — demottle 去斑驳 HTTP 服务（demottle_v16，grain=0.5）
           GET  /readyz                      预热完成后 200（含版本、构建号），否则 503
           GET  /metrics                     Prometheus 文本格式（含斑驳尺度 σ 分布、按 grain 的请求数）
           grain 不传用 DEMOTTLE_GRAIN；可按请求设置做线上 A/B（同一进程内互不干扰）
-回退      DEMOTTLE_SYN_CAP=off：关掉 v16 的合成颗粒封顶，输出与 v15 逐位相同（响应头带 syn_cap=off）
-          DEMOTTLE_GATES=off：再关掉 v15 的纹理门与中尺度结构门（同时关封顶），输出与 v13 逐位相同（响应头带 gates=off）
-          两者都不用换镜像
+回退      DEMOTTLE_PLAN_A=off：关掉 v17 的四个开关（色度尺子下限、细频带、色度取向门、色度块取整一致化），输出与 v16 逐位相同（响应头带 plan_a=off）
+          DEMOTTLE_SYN_CAP=off：再关掉 v16 的合成颗粒封顶，输出与 v15 逐位相同（响应头带 syn_cap=off）
+          DEMOTTLE_GATES=off：再关掉 v15 的纹理门与中尺度结构门，输出与 v13 逐位相同（响应头带 gates=off）
+          后一级自动包含前一级；都不用换镜像
 保护      在途请求（处理中 + 排队）≥ DEMOTTLE_MAX_INFLIGHT → 429（读完并丢弃请求体，不进 GPU 队列）；请求体 > DEMOTTLE_MAX_BYTES → 413；
           先读文件头尺寸 / 位深，像素数超限 → 413、非 8 位 → 415，都在解码之前
 并发      单进程；N 个工作线程（DEMOTTLE_WORKERS），每线程独占一条 CUDA 流，CPU 段与另一线程的 GPU 段重叠。
           启动时每个线程按常见尺寸逐个预热；未预热的新尺寸独占 GPU 处理一次，之后即算已预热；预热失败进程退出
 追踪      请求头 X-Request-ID 透传（无则生成），写入响应头与日志；请求超过 DEMOTTLE_STUCK_SECONDS（60）秒自动导出全部线程栈；
           kill -USR1 <pid> 随时导出线程栈
-配置      DEMOTTLE_GRAIN=0.5  DEMOTTLE_SYN_CAP=on  DEMOTTLE_GATES=on  DEMOTTLE_WORKERS=3  DEMOTTLE_MAX_INFLIGHT=8  DEMOTTLE_MAX_BYTES=67108864
+配置      DEMOTTLE_GRAIN=0.5  DEMOTTLE_PLAN_A=on  DEMOTTLE_SYN_CAP=on  DEMOTTLE_GATES=on  DEMOTTLE_WORKERS=3  DEMOTTLE_MAX_INFLIGHT=8  DEMOTTLE_MAX_BYTES=67108864
           DEMOTTLE_MAX_PIXELS=16000000  DEMOTTLE_WARM_SIZES=1536x2048,2048x1536（宽x高）  DEMOTTLE_PNG_LEVEL=1
 启动      uvicorn service.app:app --host 0.0.0.0 --port 8000 --workers 1 --timeout-graceful-shutdown 30
 """
@@ -34,12 +35,12 @@ from PIL import Image, JpegImagePlugin
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
-import demottle_v16 as A  # noqa: E402
+import demottle_v17 as A  # noqa: E402
 from service.png_fast import encode_png, png_color_chunks  # noqa: E402
 from fastapi import FastAPI, HTTPException, Request, Response  # noqa: E402
 from fastapi.responses import JSONResponse, PlainTextResponse  # noqa: E402
 
-VERSION = 'demottle_v16'
+VERSION = 'demottle_v17'
 _bi = os.path.join(os.path.dirname(__file__), 'BUILD_INFO')
 BUILD = json.load(open(_bi)) if os.path.exists(_bi) else {'build': 'dev', 'date': ''}
 CFG = dict(grain=float(os.environ.get('DEMOTTLE_GRAIN', '0.5')),
@@ -50,14 +51,19 @@ CFG = dict(grain=float(os.environ.get('DEMOTTLE_GRAIN', '0.5')),
            warm=[tuple(int(v) for v in s.split('x')) for s in os.environ.get('DEMOTTLE_WARM_SIZES', '1536x2048,2048x1536').split(',') if s],
            png_level=int(os.environ.get('DEMOTTLE_PNG_LEVEL', '1')),
            gates=os.environ.get('DEMOTTLE_GATES', 'on').strip().lower(),
-           syn_cap=os.environ.get('DEMOTTLE_SYN_CAP', 'on').strip().lower())
-for _k in ('gates', 'syn_cap'):
+           syn_cap=os.environ.get('DEMOTTLE_SYN_CAP', 'on').strip().lower(),
+           plan_a=os.environ.get('DEMOTTLE_PLAN_A', 'on').strip().lower())
+for _k in ('gates', 'syn_cap', 'plan_a'):
     if CFG[_k] not in ('on', 'off'):
         raise SystemExit(f"DEMOTTLE_{_k.upper()} 只能是 on 或 off（收到 {CFG[_k]!r}）")
-if CFG['gates'] == 'off':                                          # 回退到 v13：门与封顶都关
+if CFG['gates'] == 'off':                                          # 回退到 v13：门、封顶、方案 A 都关
     CFG['syn_cap'] = 'off'
-GATE_KW = ({} if CFG['gates'] == 'on' else dict(tex_gate=0.0, mid_gate=0.0)) | ({} if CFG['syn_cap'] == 'on' else dict(syn_cap=0.0))
-ROLLBACK = ';gates=off' if CFG['gates'] == 'off' else ';syn_cap=off' if CFG['syn_cap'] == 'off' else ''   # 响应头标记
+if CFG['syn_cap'] == 'off':                                        # 回退到 v15：封顶与方案 A 都关
+    CFG['plan_a'] = 'off'
+GATE_KW = (({} if CFG['gates'] == 'on' else dict(tex_gate=0.0, mid_gate=0.0)) | ({} if CFG['syn_cap'] == 'on' else dict(syn_cap=0.0))
+           | ({} if CFG['plan_a'] == 'on' else dict(chroma_floor=0.0, fine_pass=0.0, chroma_iso=0.0, chroma_snap=0.0)))
+ROLLBACK = (';gates=off' if CFG['gates'] == 'off' else ';syn_cap=off' if CFG['syn_cap'] == 'off'
+            else ';plan_a=off' if CFG['plan_a'] == 'off' else '')   # 响应头标记
 log = logging.getLogger('demottle')
 logging.basicConfig(level=os.environ.get('DEMOTTLE_LOG_LEVEL', 'INFO'), format='%(asctime)s %(levelname)s %(message)s')
 faulthandler.register(signal.SIGUSR1, all_threads=True)          # kill -USR1 <pid>：导出全部线程栈到 stderr
@@ -130,7 +136,7 @@ class Metrics:
             L += ['# TYPE demottle_inflight gauge', f'demottle_inflight {self.inflight}',
                   '# TYPE demottle_ready gauge', f'demottle_ready {1 if _ready.is_set() else 0}',
                   '# TYPE demottle_build_info gauge',
-                  f'demottle_build_info{{version="{VERSION}",build="{BUILD["build"]}",grain="{CFG["grain"]}",gates="{CFG["gates"]}",syn_cap="{CFG["syn_cap"]}",workers="{CFG["workers"]}"}} 1']
+                  f'demottle_build_info{{version="{VERSION}",build="{BUILD["build"]}",grain="{CFG["grain"]}",gates="{CFG["gates"]}",syn_cap="{CFG["syn_cap"]}",plan_a="{CFG["plan_a"]}",workers="{CFG["workers"]}"}} 1']
             return '\n'.join(L) + '\n'
 
 
@@ -182,10 +188,10 @@ def _stream():
 def _run(rgb, path, bits, grain=None):
     g = CFG['grain'] if grain is None else grain
     st = _stream()
-    if st is None:                                       # 无 CUDA：v16 自动退回 v10（CPU，慢，仅供调试）
-        return A.demottle_v16(rgb, path=path, out_bits=bits, verbose=False, grain=g, **GATE_KW)
+    if st is None:                                       # 无 CUDA：v17 自动退回 v10（CPU，慢，仅供调试）
+        return A.demottle_v17(rgb, path=path, out_bits=bits, verbose=False, grain=g, **GATE_KW)
     with A.torch.cuda.stream(st):
-        out = A.demottle_v16(rgb, path=path, out_bits=bits, verbose=False, grain=g, **GATE_KW)
+        out = A.demottle_v17(rgb, path=path, out_bits=bits, verbose=False, grain=g, **GATE_KW)
         st.synchronize()
     return out
 
@@ -211,7 +217,7 @@ def _warm_all():
     for (w, h) in CFG['warm']:
         _warmed.add((h, w))
     _ready.set()
-    log.info(f'预热完成 {time.time() - t:.1f}s | {VERSION} build={BUILD["build"]} grain={CFG["grain"]} gates={CFG["gates"]} syn_cap={CFG["syn_cap"]} workers={len(ids)} '
+    log.info(f'预热完成 {time.time() - t:.1f}s | {VERSION} build={BUILD["build"]} grain={CFG["grain"]} gates={CFG["gates"]} syn_cap={CFG["syn_cap"]} plan_a={CFG["plan_a"]} workers={len(ids)} '
              f'max_inflight={CFG["max_inflight"]} 尺寸 {CFG["warm"]}')
 
 
@@ -334,7 +340,7 @@ def readyz():
     if not _ready.is_set():
         raise HTTPException(503, '预热中')
     return {'ready': True, 'version': VERSION, 'build': BUILD['build'], 'build_date': BUILD.get('date', ''),
-            'grain': CFG['grain'], 'gates': CFG['gates'], 'syn_cap': CFG['syn_cap'], 'workers': CFG['workers'], 'max_inflight': CFG['max_inflight']}
+            'grain': CFG['grain'], 'gates': CFG['gates'], 'syn_cap': CFG['syn_cap'], 'plan_a': CFG['plan_a'], 'workers': CFG['workers'], 'max_inflight': CFG['max_inflight']}
 
 
 @app.get('/metrics')

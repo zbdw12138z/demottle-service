@@ -1,4 +1,27 @@
 """
+demottle_v17.py — 线上版（2026-11-11 用户确认）：v16 + 四个开关（方案 A），默认全开；四个全关时与 v16 逐位相同（服务回退 DEMOTTLE_V17=off）。实测与取舍见 docs/versions.md 与 out/v17_research/REPORT.md
+
+起因（全部按线上口径量：JPEG 进 → 处理 → 同表 q92 4:2:0 JPEG 出）：
+  · 孪生真值（同一输入生成两次）上 v16 只去掉可比平坦区随机起伏的约 14%（亮度 3–12s）与 5–8%（色度）；
+  · 去色斑的修正量小于 8 位 + 4:2:0 的块取整粒度，再编码后几乎全部回来（PNG 出 a* 残留 0.72，JPEG 出 0.95）；
+  · 平坦区一半面积被粗尺度取向门挡住（光照斜坡的残余、真实的有向结构），细尺度斑驳跟着一起没去；
+  · 黑白 / 近中性图色度尺子退化为 0，整面墙被当成"软物体"钉住不处理（keeper 约 2%）。
+开关（demottle_v17 的关键字参数，或环境变量 DEMOTTLE_V17="key=val;key=val"，环境变量优先）：
+  chroma_floor  色度尺子下限（1 = 开）：JPEG 输入时，判定用的色度 σ 不低于色度 DC 量化噪声（步长 / 8 / √12 级）。
+                只影响色度 σ 退化的图（黑白、近中性）；彩色图上不起作用
+  fine_pass     细频带单独判定（0 = 关；值 = 相对 strength 的力度，1 = 同力度）：斑驳场里 fine_split（默认 12px）以下的
+                部分另算权重——幅度门照旧，取向门改为检验细频带自己（不再受光照斜坡残余影响）——
+                在原权重不足处补减细频带。原权重已通过处不变
+  chroma_iso    色度的取向门（1 = 改为检验色度残差自己；2 = 色度不过取向门）：亮度残差的方向性与色斑无关；
+                真实色彩结构仍由色度堤坝、色度幅度门、纹理门、皮肤掩码挡
+  chroma_snap   JPEG 色度块取整一致化（1 = 开；需输入是 4:2:0 JPEG）：见 _chroma_snap。让去色斑的结果过得了再编码
+  snap_sigma    一致化时邻域平滑的 σ（色度块数，默认 1.5）
+  jpeg_snr / jpeg_qstep  实验，未采纳：JPEG 分支也用局部信噪比判据成堤、反差门的量化步长改用解码后的真实台阶。
+                植物图叶子反差保持 0.67 → 0.84（PNG 分支 0.98），但墙面被色阶等高线切碎，很平区可处理面积少约三成
+默认（方案 A，线上用 grain=0.5）：chroma_floor=1; fine_pass=1; chroma_iso=1; chroma_snap=1。chroma_iso=2（方案 B）不过 quick 的"实拍少改"，不用
+另：_TLS.dbg 设为 dict 时记录各道门的权重（诊断用，不改变结果；tools/research/v17_diag.py）。
+
+以下为 v16 的说明。
 demottle_v16.py — v15 + 第 6 步合成颗粒封顶（GPU）
 
 起因：keeper 实单全量复测（2026-10-27）里，平坦区 13% 配对最细尺度（0.7–1.5s）亮度能量超过实拍 1.5 倍（出图本身 2%），
@@ -7,7 +30,7 @@ JPEG 平坦区细节层换成胶片式颗粒时，颗粒幅度是全图一个值
 细纹理补偿（grain）只再加约 14%。v16 加一个开关（关掉时与 v15 逐位相同）：
   syn_cap  合成颗粒封顶（默认 1 = 开）：每处合成颗粒的局部 rms 不超过原图同处细节的局部 rms——"亮度 − 1.5s 高斯"
            与整个细节层（"− 3s 高斯"）两个口径取较严者，8s 窗口；三个通道同一缩放。替换只换掉 JPEG 块纹理，不添能量
-  环境变量 DEMOTTLE_V16="key=val;key=val" 覆盖开关（实验用）。无 torch 时退回 v10（不含 v15 / v16 的改动）。
+  环境变量 DEMOTTLE_V17="key=val;key=val" 覆盖开关（实验用）。无 torch 时退回 v10（不含 v15 / v16 的改动）。
 
 以下为 v15 的说明。
 demottle_v15.py — v13 + 真实纹理保护（GPU）
@@ -20,7 +43,7 @@ demottle_v15.py — v13 + 真实纹理保护（GPU）
             纹理 5–30）。真实材质处：平面遍不减斑驳，第 6 步不换细节层。
   mid_gate  中尺度结构门（默认 1 = 开）：2–8px 频带局部 rms ≥ 1 → 2 L* 处视为真实结构（虚焦蕾丝网纹 ≈ 4 L*，
             平坦区斑驳 ≤ 0.8 L*），平面遍不减；保住虚焦蕾丝、虚焦树叶，keeper 效果尺子与不开时相同
-  环境变量 DEMOTTLE_V16="key=val;key=val" 覆盖开关（实验用）。无 torch 时退回 v10（不含以上保护）。
+  环境变量 DEMOTTLE_V17="key=val;key=val" 覆盖开关（实验用）。无 torch 时退回 v10（不含以上保护）。
 
 以下为 v13 的说明。
 demottle_v13.py — 实验版：v12 + 可选的效果改进开关（默认全关，此时与 v12 逐位相同）
@@ -79,6 +102,8 @@ except Exception:
 DEV = None
 _OPT_DEFAULT = dict(chroma_mult=2.5, fine_keep=0.0, grain=0.0, grain_tab=(0.445, 0.363, 0.354, 0.275), skin_chroma_free=0.0, chroma_pass=0.0,
                     tex_gate=1.0, mid_gate=1.0, syn_cap=1.0)
+_V17_DEFAULT = dict(fine_pass=1.0, fine_split=12.0, chroma_iso=1.0, chroma_floor=1.0, chroma_snap=1.0, snap_sigma=1.5, jpeg_snr=0.0, jpeg_qstep=0.0, surf_robust=0.0)
+_OPT_DEFAULT.update(_V17_DEFAULT)
 
 
 def _opt():
@@ -839,12 +864,16 @@ def unified_barrier(ctx, lo=6.0, hi=9.0, dilate_px=5):
         r_snr = gs / (local_median(gs, int(61 * s)) + 1e-6)
         gcs = torch.maximum(grad_mag(labt[..., 1], 1.6 * s), grad_mag(labt[..., 2], 1.6 * s))
         r_snr = torch.maximum(r_snr, gcs / (local_median(gcs, int(61 * s)) + 1e-6))
+    elif _opt()['jpeg_snr'] > 0:                         # v17 实验：JPEG 分支也用局部信噪比判据（亮度；梯度取 es 尺度并已乘格线权重，8px 块边不触发）
+        r_snr = g / (local_median(g, int(61 * s)) + 1e-6)
     else:
         r_snr = torch.zeros_like(r)
     n = int(15 * s) | 1
     def rng(x):
         b = gauss(x, es); return dilate(b, n) - erode(b, n)
     cm = 6.0 if ctx['jpeg'] else 3.0
+    if ctx['jpeg'] and _opt()['jpeg_qstep'] > 0 and ctx.get('qdc') is not None:   # v17 实验：反差门的"量化步长"取解码后真实的色阶台阶（max(1 级, DC 步长 / 8)），而不是 DC 系数步长
+        qL = max(1.0, ctx['qdc'][0] / 8.0) / 255.0; qC = max(1.0, ctx['qdc'][1] / 8.0) / 255.0 * 1.3
     contrast = (rng(L) > max(cm * float(sig[0]), 3.0 * qL)) | \
                (torch.maximum(rng(labt[..., 1]), rng(labt[..., 2])) > max(cm * float(max(sig[1], sig[2])), 3.0 * qC))
     r = r * contrast; r_snr = r_snr * contrast
@@ -900,6 +929,23 @@ def mid_weight(labt, s):
     return gauss(clip01((torch.sqrt(gauss(mid * mid, 12 * s)) - 1.0) / 1.0), 6 * s)
 
 
+def _surface_sigma_robust(m_s, M_s, sig_global, min_px=400, lo=0.7, hi=4.0):
+    """同 V.surface_sigma（堤坝之间每个连通表面用自己的残差定斑驳尺子，夹在全局值的 [lo, hi] 倍），
+    但幅度估计用 |m| 的中位数 × 1.4826（高斯下同样等于 σ）代替 |m| 均值 × 1.2533。
+    斑驳铺满整个表面，两种估计相同；表面上只占小部分的软物体（暗墙前的虚焦叶子）会把均值撑大、
+    让自己落进幅度门以内，中位数不受它影响。"""
+    from scipy import ndimage
+    n, lbl = cv2.connectedComponents((M_s > 0).astype(np.uint8), connectivity=4)
+    cnt = np.bincount(lbl.ravel(), minlength=n).astype(np.float64)
+    idx = np.arange(n); out = np.empty(m_s.shape, np.float32)
+    for c in range(m_s.shape[-1]):
+        med = np.asarray(ndimage.median(np.abs(m_s[..., c]), labels=lbl, index=idx), np.float64)
+        sc = np.clip(1.4826 * med, lo * sig_global[c], hi * sig_global[c])
+        sc[cnt < min_px] = sig_global[c]; sc[0] = sig_global[c]
+        out[..., c] = sc[lbl]
+    return out
+
+
 def region_pass(labt, ctx, block, sig_diff, T_near, T_far, far_px, pin_seed, fade_px,
                 grain_sigma, restrict=None, chroma_boost=True, sig_override=None, gate='all', prot=None):
     H, W, s = ctx['H'], ctx['W'], ctx['s']
@@ -912,13 +958,20 @@ def region_pass(labt, ctx, block, sig_diff, T_near, T_far, far_px, pin_seed, fad
         return None
     n_iter = max(9, int((sig_diff * ds) ** 2))
     n_iter_c = int(n_iter * _opt()['chroma_mult']) if chroma_boost else n_iter
+    M_s0 = M_s
     for p in range(2):
         S_s, SM_s = masked_diffuse(base_s, M_s, n_iter, 1.0, return_state=True)
         m_s = (base_s - S_s) * M_s[..., None]
         if sig_override is None:
             flat = M_s > 0
             sig = np.array([mad(m_s[..., c][flat]) + 1e-9 for c in range(3)], np.float32)
-            sigmap = up(V.surface_sigma(dn(m_s), dn(M_s), sig))
+            if _opt()['surf_robust'] > 0:                # v17 实验：表面尺子用中位数（稀疏的软物体不再把所在表面的尺子撑大）
+                sigmap = up(_surface_sigma_robust(dn(m_s), dn(M_s), sig))
+            else:
+                sigmap = up(V.surface_sigma(dn(m_s), dn(M_s), sig))
+            if _opt()['chroma_floor'] > 0 and ctx.get('qdc') is not None:   # v17：色度尺子不低于 JPEG 色度 DC 量化噪声（黑白 / 近中性图上色度 MAD 退化为 0）
+                fl = _opt()['chroma_floor'] * ctx['qdc'][1] / 8.0 / 3.4641 / 128.0
+                sigmap = torch.cat([sigmap[..., :1], torch.clamp(sigmap[..., 1:], min=fl)], -1)
         else:
             sig = np.asarray(sig_override, np.float32)
             sigmap = up(sig).view(1, 1, 3).expand_as(m_s)
@@ -948,10 +1001,13 @@ def region_pass(labt, ctx, block, sig_diff, T_near, T_far, far_px, pin_seed, fad
         iso = gauss(clip01((0.55 - c_res) / 0.20), 6 * s)
     else:
         c_res = resize_linear(coherence(m_s[..., 0].contiguous(), 20 * s * ds), W, H)
-        iso = gauss(torch.minimum(clip01((0.55 - c_res) / 0.20), clip01((0.60 - coherence(fine_b, 12 * s)) / 0.20)), 6 * s)
+        iso_res = clip01((0.55 - c_res) / 0.20); iso_fine = clip01((0.60 - coherence(fine_b, 12 * s)) / 0.20)
+        iso = gauss(torch.minimum(iso_res, iso_fine), 6 * s)
+        if getattr(_TLS, 'dbg', None) is not None: _TLS.dbg.setdefault('iso_parts', []).append((iso_res, iso_fine))
+    R0 = R1                                              # 未乘取向门的限制权重（v17 的细频带 / 色度另用各自的取向门）
     R1 = R1 * iso
     if prot is not None:                                 # v15：真实材质 / 中尺度结构处不当斑驳
-        R1 = R1 * (1 - prot)
+        R1 = R1 * (1 - prot); R0 = R0 * (1 - prot)
     w0 = clip01(1 - d2 / T ** 2) * M * R1
     w = torch.minimum(w0, gauss(w0, 10 * s))
     fill = torch.stack([normconv(m[..., c] * w, w, 10 * s) for c in range(3)], -1)
@@ -959,16 +1015,88 @@ def region_pass(labt, ctx, block, sig_diff, T_near, T_far, far_px, pin_seed, fad
     fade = gauss(clip01(1 - dist / (fade_px * s)), 8 * s) * R1
     m_final = w[..., None] * m + (1 - w[..., None]) * fill * fade[..., None]
     d2_ab = (m[..., 1] / (float(sig[1]) + 1e-9)) ** 2 + (m[..., 2] / (float(sig[2]) + 1e-9)) ** 2
-    wc0 = clip01(1 - d2_ab / (1.5 * T) ** 2) * clip01(1 - d2 / (2 * T) ** 2) * M * R1
+    R1c = R1
+    if _opt()['chroma_iso'] >= 2 and gate == 'all':      # v17：色度不过取向门——亮度残差的方向性（褶皱、光照斜坡）与色斑无关；真实色彩结构由色度堤坝与色度幅度门挡
+        R1c = R0
+    elif _opt()['chroma_iso'] > 0 and gate == 'all':     # 实验：取向门改为检验色度残差自己（JPEG 色度是 16px 块状格点，相干度偏高，实测仍挡掉约一半）
+        c_ab = resize_linear(torch.maximum(coherence(m_s[..., 1].contiguous(), 20 * s * ds), coherence(m_s[..., 2].contiguous(), 20 * s * ds)), W, H)
+        R1c = R0 * gauss(clip01((0.55 - c_ab) / 0.20), 6 * s)
+    wc0 = clip01(1 - d2_ab / (1.5 * T) ** 2) * clip01(1 - d2 / (2 * T) ** 2) * M * R1c
+    if getattr(_TLS, 'dbg', None) is not None:
+        _TLS.dbg.setdefault('chroma_parts', []).append(dict(amp_c=clip01(1 - d2_ab / (1.5 * T) ** 2), amp_all=clip01(1 - d2 / (2 * T) ** 2), R1c=R1c, R0=R0, M=M))
     w_ab = torch.maximum(w, torch.minimum(wc0, gauss(wc0, 10 * s)))
     m_final = torch.stack([m_final[..., 0]] + [w_ab * m[..., c] + (1 - w_ab) * fill[..., c] * fade for c in (1, 2)], -1)
-    return dict(base=base, grain=labt - base, m=m_final, w=w, M=M, dist_b=dist_b, sig=sig)
+    w_f = None
+    if _opt()['fine_pass'] > 0 and gate == 'all':        # v17：细频带（base 到 fine_split 之间）单独判定，补上被粗尺度判据挡住的平坦区
+        n_f = max(4, int(round((_opt()['fine_split'] * s * ds) ** 2)))
+        mf_s = (base_s[..., 0] - masked_diffuse(base_s[..., :1].contiguous(), M_s, n_f, 1.0)[..., 0]) * M_s
+        flat = M_s > 0
+        ratio = (mad(mf_s[flat]) + 1e-9) / (mad(m_s[..., 0][flat]) + 1e-9)          # 细频带斑驳尺子：沿用各表面的尺子 × 全图细 / 全频带之比
+        d2f = resize_linear((mf_s / (sigmap[..., 0] * ratio)) ** 2, W, H)
+        iso_f = clip01((0.55 - resize_linear(coherence(mf_s.contiguous(), 20 * s * ds), W, H)) / 0.20)
+        iso_f = gauss(torch.minimum(iso_f, iso_fine), 6 * s)
+        wf0 = clip01(1 - d2 / T ** 2) * clip01(1 - d2f / T ** 2) * M * R0 * iso_f   # 幅度门照旧（有物体处不动），只是不再受粗尺度取向门
+        w_f = torch.minimum(wf0, gauss(wf0, 10 * s))
+        mf = resize_linear(mf_s, W, H)
+        extra = _opt()['fine_pass'] * clip01(w_f - w) * mf
+        m_final = torch.cat([(m_final[..., 0] + extra)[..., None], m_final[..., 1:]], -1)
+    dbg = getattr(_TLS, 'dbg', None)
+    if dbg is not None:                                  # 诊断用：各道门的权重（不改变结果）
+        dbg.setdefault('rp', []).append(dict(M=M, M0=resize_linear(M_s0, W, H), iso=iso, amp=clip01(1 - d2 / T ** 2), w=w, w_ab=w_ab, fade=fade,
+                                             amp_L=clip01(1 - resize_linear((m_s[..., 0] / sigmap[..., 0]) ** 2, W, H) / T ** 2),
+                                             m=m, m_final=m_final, restrict=restrict, prot=prot, sig=sig, n_iter=n_iter, sig_diff=sig_diff, w_f=w_f))
+    return dict(base=base, grain=labt - base, m=m_final, w=w, M=M, dist_b=dist_b, sig=sig, w_ab=w_ab, w_f=w_f)
+
+
+def _jpeg_layout(path):
+    """(亮度 DC 步长, 色度 DC 步长)、是否 4:2:0；非 JPEG 返回 (None, False)"""
+    if path is None:
+        return None, False
+    try:
+        from PIL import Image
+        im = Image.open(path); q = im.quantization
+        if not q:
+            return None, False
+        lay = getattr(im, 'layer', None) or []
+        sub = len(lay) == 3 and tuple(lay[0][1:3]) == (2, 2) and tuple(lay[1][1:3]) == (1, 1) and tuple(lay[2][1:3]) == (1, 1)
+        return (float(q[0][0]), float(q[min(1, max(q.keys()))][0])), bool(sub)
+    except Exception:
+        return None, False
+
+
+def _chroma_snap(rgbf, conf, qc, sg):
+    """v17：JPEG 色度块取整一致化（输入、输出都是同一张量化表的 4:2:0 JPEG 时用）。
+    4:2:0 下每个 16×16 像素块的 Cb / Cr 基本只有一个 DC；解码器把它取整到 8 位，所以平坦面上解码出来的色度是"每块一个整数级"。
+    去色斑后的色度是平滑的小数值（修正量约 0.1 级），编码—解码逐块取整时，凡是落在两个整数之间的地方相邻块仍来回跳 1 级
+    ——色斑以块状原样回到交付的 JPEG 里（keeper 实测：平坦区 a* 6–12s 对实拍 1.42 → 0.96，再编码后回到 1.26）。
+    这里在已判为"可去色斑"的块上（块内色度权重 conf 均值 > 0.5），取"邻域平滑后的色度"取整的那一级 k 为目标：
+    块均值离 k 不到 0.25 级的不动（编码—解码本来就会取到 k：DC 步长 q92 为 3/8 级，最坏再偏 0.19 级，仍在 ±0.5 内）；
+    超出的只挪到 k ± 0.25 的边上（最小挪动）。相邻块于是落在同一级，不再来回跳。只挪色度，亮度 Y 不变；
+    需要挪动超过 0.5 级的块（块内有真实色彩变化）不动。DC 步长大于 1 级的低质量表，取整单位改用步长。"""
+    H, W = rgbf.shape[:2]; P = 16; hb, wb = H // P, W // P
+    if hb < 4 or wb < 4:
+        return rgbf
+    x = rgbf[:hb * P, :wb * P] * 255.0
+    pool = lambda t: t.reshape(hb, P, wb, P).mean((1, 3))
+    on = (pool(conf[:hb * P, :wb * P]) > 0.5).float()
+    unit = max(1.0, qc / 8.0); offs = []
+    for co in ((-0.168736, -0.331264, 0.5), (0.5, -0.418688, -0.081312)):
+        u = pool(co[0] * x[..., 0] + co[1] * x[..., 1] + co[2] * x[..., 2]) / unit
+        ubar = gauss((u * on).contiguous(), sg) / torch.clamp(gauss(on.contiguous(), sg), min=1e-6)
+        k = torch.round(ubar)
+        d = torch.clamp(u, k - 0.25, k + 0.25) - u       # 最小挪动：只把会取到别的级的块拉回 k 的安全带内
+        d = torch.where((on > 0) & (d.abs() <= 0.5), d, torch.zeros_like(d)) * unit
+        offs.append(d.repeat_interleave(P, 0).repeat_interleave(P, 1))
+    dcb, dcr = offs
+    y = torch.stack([x[..., 0] + 1.402 * dcr, x[..., 1] - 0.344136 * dcb - 0.714136 * dcr, x[..., 2] + 1.772 * dcb], -1)
+    out = rgbf.clone(); out[:hb * P, :wb * P] = clip01(y / 255.0)
+    return out
 
 
 # ================================================================= 主函数
-def demottle_v16(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=4.5, out_bits=8, T_near=3.0, T_far=6.0,
+def demottle_v17(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=4.5, out_bits=8, T_near=3.0, T_far=6.0,
                  far_px=40, pin_seed=4.0, fade_px=80, verbose=True, seed=0, chroma_mult=2.5, fine_keep=0.0, grain=0.0,
-                 skin_chroma_free=0.0, chroma_pass=0.0, tex_gate=1.0, mid_gate=1.0, syn_cap=1.0):
+                 skin_chroma_free=0.0, chroma_pass=0.0, tex_gate=1.0, mid_gate=1.0, syn_cap=1.0, **v17):
     """参数与返回值同 demottle_v10；有 CUDA 时在 GPU 上运行，否则直接调用 v10"""
     global DEV
     DEV = pick_device()
@@ -976,7 +1104,7 @@ def demottle_v16(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=
         return V.demottle_v10(img_u8, path=path, strength=strength, skin_strength=skin_strength, clean_far=clean_far,
                               out_bits=out_bits, T_near=T_near, T_far=T_far, far_px=far_px, pin_seed=pin_seed,
                               fade_px=fade_px, verbose=verbose, seed=seed)
-    env = dict(kv.split('=') for kv in os.environ.get('DEMOTTLE_V16', '').split(';') if '=' in kv)   # 实验用：回归工具不传参数时覆盖开关
+    env = dict(kv.split('=') for kv in os.environ.get('DEMOTTLE_V17', '').split(';') if '=' in kv)   # 实验用：回归工具不传参数时覆盖开关
     chroma_mult = float(env.get('chroma_mult', chroma_mult)); fine_keep = float(env.get('fine_keep', fine_keep))
     grain = float(env.get('grain', grain)); skin_chroma_free = float(env.get('skin_chroma_free', skin_chroma_free))
     chroma_pass = float(env.get('chroma_pass', chroma_pass))
@@ -986,6 +1114,11 @@ def demottle_v16(img_u8, path=None, strength=0.8, skin_strength=0.85, clean_far=
         _TLS.opt = dict(chroma_mult=float(chroma_mult), fine_keep=float(fine_keep), grain=float(grain), grain_tab=(0.445, 0.363, 0.354, 0.275),
                     skin_chroma_free=float(skin_chroma_free), chroma_pass=float(chroma_pass), tex_gate=float(tex_gate), mid_gate=float(mid_gate),
                     syn_cap=float(syn_cap))
+        for k, d in _V17_DEFAULT.items():                # v17 新开关：关键字参数或环境变量（环境变量优先）
+            _TLS.opt[k] = float(env.get(k, v17.get(k, d)))
+        bad = set(v17) - set(_V17_DEFAULT)
+        if bad:
+            raise TypeError(f'demottle_v17: 未知参数 {sorted(bad)}')
         return _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_far, far_px, pin_seed, fade_px, verbose, seed)
 
 
@@ -1003,6 +1136,7 @@ def _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_f
                 lab0 = None; img_np = dn(img_t)
     skin_fut = _POOL.submit(_skin_cpu, img_np, s)                 # 人脸与肤色连通域：与 GPU 同时进行
     ctx = analyze(img_t, path, lab0)
+    ctx['qdc'], ctx['sub420'] = _jpeg_layout(path)
     labt = ctx['labt']; sig = ctx['sigma']
     if verbose:
         print(f"device {DEV} | fingerprint 16px corr {fp_corr:.2f} → {'removed, p2p %.2f lvl' % fp_p2p if fp_p2p else 'skipped'}")
@@ -1024,8 +1158,10 @@ def _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_f
     prot = None                                          # v15：真实材质 / 中尺度结构保护（0–1）
     if _opt()['tex_gate'] > 0:
         prot = _opt()['tex_gate'] * texture_weight(labt, s, ctx['jpeg'])
+        if getattr(_TLS, 'dbg', None) is not None: _TLS.dbg['prot_tex'] = prot
     if _opt()['mid_gate'] > 0:
         mw = _opt()['mid_gate'] * mid_weight(labt, s)
+        if getattr(_TLS, 'dbg', None) is not None: _TLS.dbg['prot_mid'] = mw
         prot = mw if prot is None else torch.maximum(prot, mw)
     R = region_pass(labt, ctx, barrier, sig_diff, T_near, T_far_eff, far_px, pin_seed, fade_px, grain_sigma,
                     restrict=clip01(1 - S_skin), prot=prot)
@@ -1100,6 +1236,7 @@ def _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_f
             cap = torch.minimum(torch.minimum(o_f / (a_L * k_f), o_d / a_L), torch.ones_like(a_L))
             cap = 1 - _opt()['syn_cap'] * (1 - cap)
             syn = syn * cap[..., None]
+        if getattr(_TLS, 'dbg', None) is not None: _TLS.dbg['interior'] = interior[..., 0]
         out = out - R['grain'] * interior + syn * interior + 0.4 * syn * (1 - interior)
     if out_bits == 8:
         dith = (di - 0.5) * 0.004 * clip01(Lref / 0.05)
@@ -1119,7 +1256,12 @@ def _run(img_u8, path, strength, skin_strength, clean_far, out_bits, T_near, T_f
         zone = clip01(1 - S_skin)                        # 皮肤细节生图已多于实拍，不加
         nz = _grain_field(seed, H, W, s)
         out = torch.cat([(Lc + add * zone * nz)[..., None], out[..., 1:]], -1)
+    dbg = getattr(_TLS, 'dbg', None)
+    if dbg is not None:
+        dbg.update(barrier=barrier, S_skin=S_skin, labt=labt, out=out, ctx={k: v for k, v in ctx.items() if k != 'labt'}, prot=prot)
     rgbf = lab2rgb01(out)
+    if _opt()['chroma_snap'] > 0 and ctx['qdc'] is not None and ctx['sub420'] and R.get('w_ab') is not None:
+        rgbf = _chroma_snap(rgbf, R['w_ab'], ctx['qdc'][1], _opt()['snap_sigma'])
     if out_bits == 16:
         res = dn((rgbf * 65535 + 0.5).to(torch.int32)).astype(np.uint16)
         rgb = None
@@ -1158,7 +1300,7 @@ def warmup(sizes=((2048, 1536),), bits=(8,)):
         img = (rng.random((h, w, 3)) * 40 + 100).astype(np.uint8)
         img = cv2.GaussianBlur(img, (0, 0), 20)
         for b in bits:
-            demottle_v16(img, out_bits=b, verbose=False)
+            demottle_v17(img, out_bits=b, verbose=False)
     if DEV is not None and DEV.type == 'cuda':
         torch.cuda.synchronize()
 
@@ -1168,7 +1310,7 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     bits = 16 if '--16bit' in sys.argv else 8
     im = cv2.cvtColor(cv2.imread(args[0]), cv2.COLOR_BGR2RGB)
-    t = time.time(); out, _ = demottle_v16(im, path=args[0], out_bits=bits)
+    t = time.time(); out, _ = demottle_v17(im, path=args[0], out_bits=bits)
     if DEV is not None and DEV.type == 'cuda':
         torch.cuda.synchronize()
     print(f"{time.time()-t:.1f}s")

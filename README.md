@@ -20,8 +20,8 @@ docker run --rm --gpus all nvidia/cuda:13.0.3-base-ubuntu24.04 nvidia-smi
 ```bash
 git clone https://github.com/zbdw12138z/demottle-service.git && cd demottle-service
 
-docker build -t demottle:v16 .        # 首次构建要下载 PyTorch 等依赖，需要几分钟
-docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name demottle demottle:v16
+docker build -t demottle:v17 .        # 首次构建要下载 PyTorch 等依赖，需要几分钟
+docker run -d --gpus all -p 8000:8000 --restart unless-stopped --name demottle demottle:v17
 
 docker exec demottle python3 tests/smoke_test.py --overload   # 自检：自动等预热（约 20 秒），最后一行 "25/25 项通过" 即可接流量
 ```
@@ -60,7 +60,7 @@ python3 tools/loadtest.py --url http://127.0.0.1:8000 --images '你的图/*.png'
 
 - 接口全部参数、错误码、环境变量、运维排障：[`docs/integration.md`](docs/integration.md)
 - 日志：`docker logs demottle`；版本（构建号）在 `/readyz` 和响应头 `X-Demottle-Version` 里，反馈问题时请带上它和请求 ID（响应头 `X-Request-ID`）
-- 回滚到上一版效果：`docker run` 时加 `-e DEMOTTLE_SYN_CAP=off`（与上一版 v15 逐位相同，不用重新构建）；再早一版（v13）用 `-e DEMOTTLE_GATES=off`
+- 回滚到上一版效果：`docker run` 时加 `-e DEMOTTLE_PLAN_A=off`（与上一版 v16 逐位相同，不用重新构建）；更早的版本：`-e DEMOTTLE_SYN_CAP=off`（v15）、`-e DEMOTTLE_GATES=off`（v13）
 
 ## 许可
 

@@ -1,7 +1,7 @@
 {
- "version": "demottle_v16",
- "build": "9ffc4f99c856",
+ "version": "demottle_v17",
+ "build": "f0408911065d",
  "date": "2026-11-11",
- "git_commit": "99fda96",
+ "git_commit": "ac7b34f",
  "git_dirty": false
 }
